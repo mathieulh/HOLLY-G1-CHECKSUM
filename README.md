@@ -1,4 +1,4 @@
-# holly_g1_checksum
+# HOLLY G1 Checksum
 
 Patch a Dreamcast BIOS image so its **HOLLY G1 checksum** comes out at `0x0000` (or another
 target). You can change bytes anywhere in the image; the script then corrects the checksum by
