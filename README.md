@@ -4,6 +4,9 @@ Patch a Dreamcast BIOS image so its **HOLLY G1 checksum** comes out at `0x0000` 
 target). You can change bytes anywhere in the image; the script then corrects the checksum by
 writing **3 bytes** at the end of a small free area just before the last 2 bytes of the image.
 
+If the parity/checksum does not pass HOLLY's verification the G1 bus (GD ROM on Dreamcast, CART/DIMM on NAOMI)
+remains in a locked state, only after the check pass does the G1 bus become unlocked.
+
 - Works on an already modified BIOS, or applies your changes for you (`--write` / `--file`)
 - With the default settings, always reaches `0x0000` (checked for every possible checksum state)
 - Changes as few bytes as possible
