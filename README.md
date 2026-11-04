@@ -406,3 +406,13 @@ The test setup:
 Each test took about **7 seconds**, so 70,000 tests add up to roughly **136 hours** (about
 5.7 days) of continuous hardware testing. The results of these tests are what made it possible
 to reduce the checksum to the algorithm in [Part 2](#part-2--how-it-works).
+
+## Contributors
+
+- [Guimli/Nicolas Weill](https://github.com/Guimli)
+
+* Ran all the tests and designed the custom hardware, worked on the algorithm
+
+- [Mathieulh](https://github.com/Mathieulh)
+
+* Worked on the algorithm, wrote the script, tested across all 131,072 states over 0x200000 bytes
