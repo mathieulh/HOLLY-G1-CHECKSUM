@@ -1,13 +1,14 @@
 # HOLLY G1 Checksum
 
-Patch a Dreamcast BIOS image so it passes HOLLY's **G1 checksum check**. You can change bytes
+Patch a Dreamcast or System SP BIOS image so it passes HOLLY's **G1 checksum check**. You can change bytes
 anywhere in the image; the script then corrects the checksum by writing **3 bytes** at the end
 of a small free area just before the last 2 bytes of the image.
 
 At boot, the BIOS writes the last address of the area to check to the `SB_SECUR_EADR`
-register, and HOLLY sums every byte read from the BIOS up to that address. On Dreamcast BIOSes
-the result is compared with the **stored value** in the last 2 bytes of the image. If they
-don't match, the G1 bus (GD-ROM on Dreamcast, cartridge/DIMM on NAOMI and Atomiswave) stays
+register, and HOLLY sums every byte read from the BIOS up to that address. On Dreamcast and
+System SP BIOSes the result is compared with the **stored value** in the last 2 bytes of the
+image. If they don't match, the G1 bus (GD-ROM on Dreamcast, cartridge/DIMM on NAOMI, System SP
+and Atomiswave) stays
 locked. The bus is only unlocked once the check passes.
 
 - Works on an already modified BIOS, or applies your changes for you (`--write` / `--file`)
@@ -21,6 +22,8 @@ locked. The bus is only unlocked once the check passes.
 
 > [!WARNING]
 > **Only Dreamcast BIOSes (retail and Develop) are fully supported.**
+> - **System SP:** supported. Official BIOSes follow the Dreamcast rule, but no patched
+>   System SP BIOS has been booted yet.
 > - **NAOMI / NAOMI 2:** experimental (`--reference`). The checked size is known (`0x200000`),
 >   but official NAOMI BIOSes do **not** follow the stored-value rule, and the exact rule is
 >   unknown. Patched files have **not** been tested on hardware.
@@ -75,6 +78,7 @@ from the BIOS itself (see [Automatic size detection](#automatic-size-detection))
 |---|---|---|
 | Retail Dreamcast BIOS (`mpr-*`, `dc_boot`, `set5*`) | `0x200000` | **Supported** |
 | NAOMI / Dreamcast **Develop** BIOS | `0x400` | **Supported**, validated on NAOMI hardware, also works on Dreamcast |
+| System SP BIOS (`epr-24236a`, `epr-24328`, `epr-24328a`) | `0x200000` | **Supported** (official BIOSes verify; patched files not yet tested on hardware) |
 | NAOMI / NAOMI 2 BIOS (`epr-215xx`, `epr-236xx`, `epr-21336a`) | `0x200000` | **Experimental**, with `--reference` only |
 | Atomiswave BIOS (`bios0`, `bios1`) | `0xA678` | **Not supported**: rule unknown |
 | Atomiswave `fpr-24363` (BIOS at `0x60000`) | `0xA674` (with `--base 0x60000`) | **Not supported**: rule unknown |
@@ -85,6 +89,7 @@ from the BIOS itself (see [Automatic size detection](#automatic-size-detection))
 |---|---|---|---|
 | Dreamcast retail | Yes | **Yes**: checksum of the first `SIZE - 2` bytes = stored value | Verify and patch |
 | Dreamcast / NAOMI Develop | Yes | **Yes**, validated by 68,245 hardware tests | Verify and patch |
+| System SP | Yes | **Yes**: same as Dreamcast retail (all 3 official BIOSes match) | Verify and patch |
 | NAOMI / NAOMI 2 | Yes | **No** | `--reference` mode, experimental, warning printed |
 | Atomiswave | Yes | **No** | `auto` finds the size; a warning says the rule doesn't hold |
 
@@ -162,12 +167,12 @@ follows the three ways BIOSes hide the write:
 |---|---|---|
 | Dreamcast retail, set5 v0.972 and later | Boot code (around `0x34E`) and hidden loader at `0xE0` | `0x1FFFFF` |
 | set5 v0.41 / v0.71 | Hidden loader at `0xE0`, stored with its **longwords** reversed | `0x1FFFFF` |
-| NAOMI, NAOMI 2, NAOMI Develop `21336a` | Hidden loader at `0xE0`, stored with its **halfwords** reversed | `0x1FFFFF` |
+| NAOMI, NAOMI 2, NAOMI Develop `21336a`, System SP | Hidden loader at `0xE0`, stored with its **halfwords** reversed | `0x1FFFFF` |
 | Dreamcast / NAOMI Develop (`0x400`) | Loader the boot code builds in RAM at `0xAC0000E4` | `0x3FF` |
 | Atomiswave `bios0` / `bios1` | Boot code at `0x26` | `0xA677` |
 | Atomiswave `fpr-24363` | Boot code at `0x26` (relative to `--base 0x60000`) | `0xA673` |
 
-All 50 BIOSes tested give a single, consistent value. If no write is found, or two writes give
+All 53 BIOSes tested give a single, consistent value. If no write is found, or two writes give
 different values, the script stops and asks for `SIZE`. Writes of `0` and `0x42FE` (used to
 re-arm the check, e.g. before Mil-CD) are ignored. For a size other than `0x400` or
 `0x200000`, a warning is printed, because the stored-value rule is not known to hold there.
@@ -400,6 +405,26 @@ python3 holly_g1_checksum.py modified.bin out.bin auto --reference epr-21576a.ic
   [NAOMI and Atomiswave: open questions](#naomi-and-atomiswave-open-questions)). So reaching a
   reference's final value may not be what HOLLY actually requires.
 
+### System SP
+
+The three System SP BIOSes tested (`epr-24236a`, SPIDER HAT Ver. 0.010, 2004; `epr-24328` and
+`epr-24328a`, Ver. 0.020, 2005) all verify with the default rule:
+
+```sh
+python3 holly_g1_checksum.py epr-24328.ic47 auto --verify
+python3 holly_g1_checksum.py epr-24328.ic47 out.bin auto --write 0x100000=AA
+```
+
+- `auto` finds `0x1FFFFF` in the same hidden loader at `0xE0` as NAOMI, so the size is `0x200000`.
+- Checksum of `0x0`–`0x1FFFFD` = `0x0000` = stored value, for all three.
+- Patching works like Dreamcast: the default 3-byte patch goes at `0x1FFFFB`–`0x1FFFFD`, in the
+  zero tail.
+- Sega's own layout is different: its 6 adjusted bytes sit at `0x1FFDFA`–`0x1FFDFF`, bringing the
+  checksum to `(0x0000, fold 0)` **before** a `0x200`-byte zero tail. The script's end-of-image
+  patch also satisfies the stored-value rule; to mirror Sega's layout instead, use
+  `--free-area 0x206 --offset 0x1FFDFA --length 6` (not tested).
+- No patched System SP BIOS has been booted yet.
+
 ### Atomiswave (not supported)
 
 `auto` finds the checked size (`0xA678` for `bios0` / `bios1`, `0xA674` for `fpr-24363` with
@@ -462,7 +487,7 @@ def holly_check(image, size):
     return checksum(image[:size - 2]) == stored
 ```
 
-Unmodified retail Dreamcast BIOSes give `0x0000` over `0x200000` bytes.
+Unmodified retail Dreamcast and System SP BIOSes give `0x0000` over `0x200000` bytes.
 
 ### Where the size comes from: `SB_SECUR_EADR`
 
@@ -524,6 +549,16 @@ Atomiswave dumps:
   `0x200000` bytes. Region variants share the value in about half of the cases.
 - **Layout:** retail NAOMI BIOSes end with a fixed `0x200`-byte block at `0x1FFE00`, followed by
   Sega's 6 adjusted bytes. The NAOMI Develop BIOS `21336a` has neither and still boots.
+- **System SP rules out the loader:** System SP BIOSes use **the same hidden loader and read
+  pattern as NAOMI** (`0x1FFFFF` armed from RAM, then `0x100`–`0x1FFFFF` copied in one pass), and
+  they follow the stored-value rule. So the way NAOMI reads its BIOS is not what breaks the rule.
+
+| Platform | `0x1FFE00`–`0x1FFFFF` | Sega's 6 adjusted bytes | Stored-value rule |
+|---|---|---|---|
+| Dreamcast retail | Zeros | Before `0x1FFE00` | Holds |
+| System SP | Zeros | `0x1FFDFA`–`0x1FFDFF` | Holds |
+| NAOMI / NAOMI 2 retail | `0x200`-byte data block | Inside the block, `0x1FFFFA`–`0x1FFFFF` | Doesn't hold |
+| NAOMI Develop `21336a` | Zeros | None | Doesn't hold (checksum `0x2349`) |
 
 So on these boards either the comparison works differently, or HOLLY's internal "hardcoded
 value" is not fixed. Only hardware tests can tell; see [Contribution](#contribution).
