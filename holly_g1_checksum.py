@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
-"""HOLLY G1 (NAOMI) checksum - patch a BIOS so its checksum matches a target (0x0000 by default).
+"""HOLLY G1 checksum - patch a Dreamcast BIOS image so HOLLY accepts it.
 
-Same algorithm as checksum_g1_simplifie.py (spread + addition + sticky XOR + fold
-pattern toggled 0 <-> 0x1104 on overflow), computed over the first (size - 2) bytes
-of the BIOS image.
+HOLLY G1 check (validated against 68,245 tests on real hardware):
+  - a checksum is computed over the first (size - 2) bytes of the BIOS image
+    (spread + addition + sticky XOR + fold pattern toggled 0 <-> 0x1104 on overflow);
+  - the result is compared with the STORED value: the last 2 bytes of the image,
+    little-endian. G1 opens if and only if they are equal.
+  A BIOS whose last 2 bytes are 00 00 therefore needs a checksum of 0x0000.
 
 BIOS image location inside the file:
   --base  start of the BIOS image in the file (default 0x0)
   size    size of the BIOS image (positional), base + size <= file size
-  e.g. a 0x200000 file holding a 0x400 BIOS at offset 0 -> size = 0x400.
+  e.g. a 0x200000 file holding a 0x400 Develop BIOS at offset 0 -> size = 0x400.
   Bytes outside [base, base + size) are copied unchanged to the output.
   All offsets (--write, --file, --offset, messages) are RELATIVE TO THE BIOS IMAGE.
 
 How it works:
   - optional changes at any offset (--write / --file); without them, the input is
     treated as an already modified BIOS;
-  - the checksum is compensated by a few bytes placed in the FREE AREA of
+  - the target is the stored value (last 2 bytes). It can be changed with --set-stored;
+  - the checksum is corrected by a few bytes placed in the FREE AREA of
     'free_area' bytes located just before the last 2 bytes:
         [size - 2 - free_area, size - 2)
     Default free_area = 8 bytes (64 bits); the 3-byte patch always fits in it.
     e.g. size = 0x400, free_area = 8 -> free area 0x3F6 to 0x3FD inclusive.
   - by default the patch (3 bytes) is placed at the very end of the free area
-    (size - 5 .. size - 3): nothing follows it, so 0x0000 is always reachable
-    (checked against all 131072 possible states).
+    (size - 5 .. size - 3): nothing follows it, so the target can be reached
+    (exhaustive check for 0x0000 over all 131072 states; sampled for other targets).
   - among all valid patches, the one that changes the FEWEST bytes is chosen
     (ties: the one closest to the padding byte, 0x00 or 0xFF, of the free area).
 
 Safety:
-  - BIOS sizes above 0x200000 (2 MiB) are refused unless --force is given
-    (a warning is still printed with --force);
+  - BIOS sizes above 0x200000 (2 MiB) are refused unless --force is given;
   - the patch refuses to overwrite non-padding bytes (other than 0x00 / 0xFF)
     unless --force is given;
   - the output must differ from the input; it is written to a temporary file,
@@ -40,11 +43,11 @@ to the output, so changes can be shared without distributing the BIOS.
 Exit codes: 0 = OK, 1 = failure / refused, 2 = invalid arguments.
 
 Examples:
-  checksum_g1_patch_en_v4.py bios.bin out.bin 0x200000
-  checksum_g1_patch_en_v4.py bios.bin out.bin 0x400 --write 0x10=DEADBEEF
-  checksum_g1_patch_en_v4.py bios.bin out.bin 0x200000 --file 0x8000=logo.bin --patch-file out.bps
-  checksum_g1_patch_en_v4.py dump.bin out.bin 0x400 --base 0x10000 --json
-  checksum_g1_patch_en_v4.py bios.bin 0x400 --verify
+  holly_g1_checksum.py bios.bin out.bin 0x200000
+  holly_g1_checksum.py bios.bin out.bin 0x400 --write 0x10=DEADBEEF
+  holly_g1_checksum.py bios.bin out.bin 0x200000 --file 0x8000=logo.bin --patch-file out.bps
+  holly_g1_checksum.py dump.bin out.bin 0x400 --base 0x10000 --json
+  holly_g1_checksum.py bios.bin 0x400 --verify
 """
 import argparse
 import json
@@ -55,13 +58,12 @@ import zlib
 
 import numpy as np
 
-DEFAULT_FREE_AREA = 8  # bytes (64 bits) just before the last 2 bytes
-MAX_BIOS_SIZE = 0x200000  # largest expected BIOS size; above it --force is required
-
-FOLD = 0x1104          # fold pattern = spread(0x52)
-PREVIEW = 16           # max bytes shown for user writes
+DEFAULT_FREE_AREA = 8      # bytes (64 bits) just before the last 2 bytes
+MAX_BIOS_SIZE = 0x200000   # largest expected BIOS size; above it --force is required
+FOLD = 0x1104              # fold pattern = spread(0x52)
+PREVIEW = 16               # max bytes shown for user writes
 PADDING = (0x00, 0xFF)
-MAX_LENGTH = 6         # max patch length (search cost grows quickly)
+MAX_LENGTH = 6             # max patch length (search cost grows quickly)
 
 
 class Fail(Exception):
@@ -100,19 +102,32 @@ def checksum(data, A=0):
     return state(data, A)[0]
 
 
+def stored_value(image, size):
+    """Value HOLLY compares the checksum with: last 2 bytes of the image, little-endian."""
+    return image[size - 2] | (image[size - 1] << 8)
+
+
+def holly_check(image, size, A=0):
+    """(ok, computed, stored) for a BIOS image of 'size' bytes starting at image[0]."""
+    computed = checksum(image[:size - 2], A)
+    stored = stored_value(image, size)
+    return computed == stored, computed, stored
+
+
 # --------------------------------------------------------------------------- patch search
 # A state is encoded as key = A | (fold active) << 16.
-# Each candidate carries a cost: 2 per byte changed from the original
-# + 1 per byte different from the padding byte. Lowest cost wins.
+# Each candidate carries a cost: (MAX_LENGTH + 1) per byte changed from the original
+# + 1 per byte different from the padding byte. Lowest cost wins. The weight makes the
+# order strict: fewest changed bytes first, then closest to padding.
 
 def byte_cost(old_byte, pad):
     v = np.arange(256, dtype=np.int64)
-    return 2 * (v != old_byte) + (v != pad)
+    return (MAX_LENGTH + 1) * (v != old_byte) + (v != pad)
 
 
 def _dedup_min(keys, cost):
     """Indices keeping, for each distinct key, the candidate with the lowest cost."""
-    comp = keys * 64 + cost                     # cost < 64 (<= 3 * MAX_LENGTH)
+    comp = keys * 64 + cost                     # cost < 64 (<= (MAX_LENGTH + 2) * MAX_LENGTH = 48)
     comp_u, idx = np.unique(comp, return_index=True)
     k = comp_u >> 6
     first = np.ones(len(k), dtype=bool)
@@ -329,6 +344,10 @@ def h(n):
     return f"0x{n:X}"
 
 
+def h4(n):
+    return f"0x{n:04X}"
+
+
 def hexstr(d, limit=None):
     """Hex representation, truncated to 'limit' bytes if requested."""
     if limit is not None and len(d) > limit:
@@ -372,8 +391,8 @@ def pair(x):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Force the HOLLY G1 checksum using a patch "
-                                            "placed in the free area at the end of the BIOS.")
+    p = argparse.ArgumentParser(description="Patch a BIOS so its HOLLY G1 checksum matches "
+                                            "the stored value (last 2 bytes).")
     p.add_argument("image", help="input file (left unchanged)")
     p.add_argument("output", nargs="?",
                    help="output file (patched copy, must differ from the input); "
@@ -382,11 +401,14 @@ def parse_args():
     p.add_argument("--base", type=integer, default=0,
                    help="start of the BIOS image in the file (default 0x0)")
     p.add_argument("--verify", action="store_true",
-                   help="only check the input checksum, write nothing "
+                   help="only check the input (checksum == stored value), write nothing "
                         "(exit code 0 = OK, 1 = FAIL)")
+    p.add_argument("--set-stored", type=integer, metavar="VALUE",
+                   help="write a new stored value (16-bit, little-endian) to the last 2 bytes "
+                        "and patch the checksum to match it")
     p.add_argument("--free-area", type=integer, default=DEFAULT_FREE_AREA,
                    help="free area size, just before the last 2 bytes: "
-                        "[size - 2 - free_area, size - 2) (default 8)")
+                        f"[size - 2 - free_area, size - 2) (default {DEFAULT_FREE_AREA})")
     p.add_argument("--offset", type=integer,
                    help="patch offset inside the free area (default: end of free area)")
     p.add_argument("--length", type=int,
@@ -402,8 +424,6 @@ def parse_args():
     p.add_argument("--patch-file", metavar="PATH",
                    help="also write an IPS (.ips) or BPS (.bps) patch from input to output")
     p.add_argument("--init", type=integer, default=0, help="initial state A (default 0)")
-    p.add_argument("--target", type=integer, default=0x0000,
-                   help="target checksum (default 0x0000)")
     out = p.add_mutually_exclusive_group()
     out.add_argument("--quiet", action="store_true", help="print only warnings and errors")
     out.add_argument("--json", action="store_true", help="print a single JSON result object")
@@ -417,12 +437,12 @@ def run(args, rep):
     if base < 0 or not 2 < size or base + size > len(image):
         raise Fail(f"BIOS image [{h(base)}, {h(base + size)}) does not fit in the file "
                    f"({h(len(image))} bytes)")
-    zone = size - 2                             # checked area: [0, zone) relative to base
     if size > MAX_BIOS_SIZE:
         msg = f"BIOS size {h(size)} exceeds the maximum of {h(MAX_BIOS_SIZE)}"
         if not args.force:
             raise Fail(msg + ". Check the size argument, or use --force to bypass the limit.")
         rep.warn(msg + " (--force)")
+    zone = size - 2                             # checked area: [0, zone) relative to base
     free_start = zone - args.free_area
     if free_start < 0:
         raise Fail("free area larger than the checked area")
@@ -431,22 +451,22 @@ def run(args, rep):
         return h(o) + (f" (file {h(base + o)})" if base else "")
 
     def bios():
-        return image[base:base + zone]
+        return image[base:base + size]
 
-    rep.set(input=args.image, size=h(size), base=h(base), target=f"0x{args.target:04X}")
+    rep.set(input=args.image, size=h(size), base=h(base))
     if base or base + size < len(image):
         rep.info(f"file             = {h(len(image))} bytes, BIOS image = "
                  f"{h(base)} .. {h(base + size - 1)} (the rest is copied unchanged)")
 
     # Verify mode: input as is, nothing written
     if args.verify:
-        if args.write or args.file or args.output or args.patch_file:
-            rep.warn("--verify ignores the output, --write, --file and --patch-file")
-        c = checksum(bios(), args.init)
-        ok = c == args.target
-        rep.set(mode="verify", checksum=f"0x{c:04X}")
-        rep.info(f"checksum         = 0x{c:04X} (target 0x{args.target:04X}) -> "
-                 f"{'OK' if ok else 'FAIL'}")
+        if args.write or args.file or args.output or args.patch_file or \
+                args.set_stored is not None:
+            rep.warn("--verify ignores the output, --write, --file, --set-stored "
+                     "and --patch-file")
+        ok, c, s = holly_check(bios(), size, args.init)
+        rep.set(mode="verify", checksum=h4(c), stored=h4(s))
+        rep.info(f"checksum         = {h4(c)}, stored = {h4(s)} -> {'OK' if ok else 'FAIL'}")
         return ok
 
     # Output path checks
@@ -467,6 +487,10 @@ def run(args, rep):
     # 1. User changes (any offset, relative to the BIOS image)
     writes = [(o, bytes.fromhex(x.replace(' ', ''))) for o, x in args.write]
     writes += [(o, open(path, 'rb').read()) for o, path in args.file]
+    if args.set_stored is not None:
+        if not 0 <= args.set_stored <= 0xFFFF:
+            raise Fail("--set-stored must be a 16-bit value (0x0000 .. 0xFFFF)")
+        writes.append((zone, args.set_stored.to_bytes(2, 'little')))
     for o, d in writes:
         if base + o < 0 or base + o + len(d) > len(image):
             raise Fail(f"write at {h(o)} ({h(len(d))} bytes) is outside the file")
@@ -475,7 +499,10 @@ def run(args, rep):
         rep.info(f"write @ {fo(o)} : {hexstr(old, PREVIEW)} -> {hexstr(d, PREVIEW)}")
     rep.set(writes=[{"offset": h(o), "length": h(len(d))} for o, d in writes])
 
-    # 2. Patch position
+    # 2. Target = stored value (last 2 bytes, after the user changes)
+    target = stored_value(bios(), size)
+
+    # 3. Patch position
     at_end = args.offset is None
     length = args.length or (3 if at_end else 4)
     if not 1 <= length <= MAX_LENGTH:
@@ -488,26 +515,26 @@ def run(args, rep):
         if o < offset + length and offset < o + len(d):
             raise Fail(f"the write at {h(o)} overlaps the patch at {h(offset)}")
 
-    before = checksum(bios(), args.init)
-    rep.set(checksum_before=f"0x{before:04X}")
-    rep.info(f"checksum before  = 0x{before:04X}")
+    before = checksum(image[base:base + zone], args.init)
+    rep.set(checksum_before=h4(before), stored=h4(target))
+    rep.info(f"checksum before  = {h4(before)}, stored = {h4(target)}")
 
-    # 3. Compute the patch (fewest changed bytes, then closest to padding)
+    # 4. Compute the patch (fewest changed bytes, then closest to padding)
     free = image[base + free_start:base + zone]
     pad = 0x00 if free.count(0x00) > free.count(0xFF) else 0xFF
     old = bytes(image[base + offset:base + offset + length])
     A, fold = state(image[base:base + offset], args.init)
     rest = bytes(image[base + offset + length:base + zone])
     if rest:
-        patch = solve_in_middle(A, fold, old, pad, rest, args.target)
+        patch = solve_in_middle(A, fold, old, pad, rest, target)
     else:
-        patch = solve_at_end(A, fold, old, pad, args.target)
+        patch = solve_at_end(A, fold, old, pad, target)
     if patch is None:
         raise Fail(f"no patch found at {h(offset)}. Omit --offset to place the patch "
-                   "at the end of the free area (always solvable).")
+                   "at the end of the free area.")
     changed = sum(a != b for a, b in zip(old, patch))
 
-    # 4. Overwrite protection: changed bytes must be padding unless --force
+    # 5. Overwrite protection: changed bytes must be padding unless --force
     data = [i for i in range(length) if patch[i] != old[i] and old[i] not in PADDING]
     if data:
         msg = (f"the patch overwrites non-padding bytes at "
@@ -522,13 +549,14 @@ def run(args, rep):
                    "changed_bytes": changed, "padding": f"0x{pad:02X}"})
     rep.info(f"patch @ {fo(offset)} : {hexstr(old)} -> {hexstr(patch)}{note}")
 
-    # 5. Write to a temp file, verify it, then rename (never a half-written output)
+    # 6. Write to a temp file, verify it, then rename (never a half-written output)
     tmp = write_temp(args.output, image)
     try:
         written = open(tmp, 'rb').read()
-        after = checksum(written[base:base + zone], args.init)
-        if written != image or after != args.target:
-            raise Fail(f"verification of the written file failed (checksum 0x{after:04X})")
+        ok, after, stored = holly_check(written[base:base + size], size, args.init)
+        if written != image or not ok:
+            raise Fail(f"verification of the written file failed "
+                       f"(checksum {h4(after)}, stored {h4(stored)})")
         tmp_patch = None
         if fmt:
             make, apply = fmt
@@ -546,8 +574,8 @@ def run(args, rep):
         if tmp and os.path.exists(tmp):
             os.unlink(tmp)
 
-    rep.set(checksum_after=f"0x{after:04X}")
-    rep.info(f"checksum after   = 0x{after:04X} -> OK")
+    rep.set(checksum_after=h4(after))
+    rep.info(f"checksum after   = {h4(after)}, stored = {h4(stored)} -> OK")
     return True
 
 
