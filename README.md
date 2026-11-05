@@ -721,6 +721,6 @@ the script is [validated against](#validation-on-hardware-1).
 ## Contributors
 
 - [Guimli/Nicolas Weill](https://github.com/Guimli)
-  - Ran all the tests and designed the custom hardware, worked on the algorithm
+  - Ran all the tests and designed the custom hardware, worked on the algorithm, wrote MiniHolly
 - [Mathieulh](https://github.com/Mathieulh)
   - Worked on the algorithm, wrote the script, tested across all 131,072 states over 0x200000 bytes
