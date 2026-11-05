@@ -8,6 +8,13 @@ HOLLY G1 check (validated against 68,245 tests on real hardware):
     little-endian. G1 opens if and only if they are equal.
   A BIOS whose last 2 bytes are 00 00 therefore needs a checksum of 0x0000.
 
+Checked size ('auto'):
+  Every HOLLY/CLX2 BIOS writes the last address of the checked area to SB_SECUR_EADR
+  (0x005F74E4). With SIZE = auto, the script finds that write in the boot code (including
+  the hidden NAOMI loader at 0xE0, stored with its halfwords or longwords reversed) and
+  uses value + 1. Found in all 47 BIOSes tested: Dreamcast / NAOMI / NAOMI 2 0x1FFFFF,
+  Atomiswave 0xA677 (bios0/bios1) and 0xA673 (fpr-24363, BIOS at 0x60000).
+
 BIOS image location inside the file:
   --base  start of the BIOS image in the file (default 0x0)
   size    size of the BIOS image (positional), base + size <= file size
@@ -62,10 +69,12 @@ Examples:
   holly_g1_checksum.py bios.bin out.bin 0x200000 --file 0x8000=logo.bin --patch-file out.bps
   holly_g1_checksum.py dump.bin out.bin 0x400 --base 0x10000 --json
   holly_g1_checksum.py bios.bin 0x400 --verify
+  holly_g1_checksum.py bios.bin auto --verify          (size read from SB_SECUR_EADR)
   holly_g1_checksum.py naomi.bin 0x200000 --verify --reference naomi_bioses/
   holly_g1_checksum.py modified.bin out.bin 0x200000 --reference naomi_bioses/
 """
 import argparse
+import struct
 import json
 import os
 import sys
@@ -418,6 +427,70 @@ def write_temp(path, data):
     return tmp
 
 
+# --------------------------------------------------------------------------- SB_SECUR_EADR
+# Every HOLLY/CLX2 BIOS writes the LAST address of the checked area to SB_SECUR_EADR
+# (0x005F74E4) before reading it (see MAME dccons_m.cpp). SIZE = value + 1.
+EADR_PHYS = 0x005F74E4
+
+def _decode_eadr_writes(code, base_addr, lo, hi):
+    """Linear scan of SH-4 code; track r0-r15 from PC-relative literals / mov #imm / add #imm /
+    mov rm,rn, and report every 'mov.l rX,@rY' where rY holds an SB_SECUR_EADR address."""
+    regs = [None] * 16
+    out = []
+    for pc in range(lo, min(hi, len(code) - 1), 2):
+        op = struct.unpack_from('<H', code, pc)[0]
+        n, m, i8 = (op >> 8) & 15, (op >> 4) & 15, op & 0xFF
+        if op >> 12 == 0xD:                                   # mov.l @(disp,PC),Rn
+            a = (pc & ~3) + 4 + i8 * 4
+            regs[n] = struct.unpack_from('<I', code, a)[0] if a + 4 <= len(code) else None
+        elif op >> 12 == 0xE:                                 # mov #imm,Rn
+            regs[n] = (i8 - 256 if i8 > 127 else i8) & 0xFFFFFFFF
+        elif op >> 12 == 0x7 and regs[n] is not None:         # add #imm,Rn
+            regs[n] = (regs[n] + (i8 - 256 if i8 > 127 else i8)) & 0xFFFFFFFF
+        elif op & 0xF00F == 0x6003:                           # mov Rm,Rn
+            regs[n] = regs[m]
+        elif op & 0xF00F == 0x2002:                           # mov.l Rm,@Rn
+            if regs[n] is not None and regs[n] & 0x1FFFFFFF == EADR_PHYS and regs[m] is not None:
+                out.append((base_addr + pc, regs[m]))
+        elif op in (0x000B, 0x002B) or op >> 12 in (0xA, 0xB) or op & 0xF0FF in (0x402B, 0x400B):
+            regs = [None] * 16                                # rts / bra / jmp / jsr: forget state
+    return out
+
+def find_eadr(bios, scan=0x1000):
+    """Return [(where, value, kind)] for SB_SECUR_EADR writes in the boot code.
+    Also decodes the NAOMI-style hidden loader: 16 halfwords at 0xE0 stored in reverse order."""
+    hits = [(pc, v, 'boot code') for pc, v in _decode_eadr_writes(bios, 0, 0, scan)]
+    if len(bios) >= 0x100:
+        h = struct.unpack_from('<16H', bios, 0xE0)
+        w = struct.unpack_from('<8I', bios, 0xE0)
+        for kind, loader in (('halfwords reversed', struct.pack('<16H', *h[::-1])),
+                             ('longwords reversed', struct.pack('<8I', *w[::-1]))):
+            hits += [(0xE0, v, f'hidden loader at 0xE0 ({kind})')
+                     for _, v in _decode_eadr_writes(loader + bytes(64), 0xE0, 0, 32)]
+    return hits
+
+
+def detect_size(bios, rep):
+    """SIZE from the SB_SECUR_EADR write(s) in the boot code."""
+    hits = [(a, v, k) for a, v, k in find_eadr(bios) if v not in (0, 0x42FE)]
+    if not hits:
+        raise Fail("size 'auto': no SB_SECUR_EADR write found in the boot code; give SIZE")
+    values = sorted({v for _, v, _ in hits})
+    for a, v, k in hits:
+        rep.info(f"SB_SECUR_EADR    = {h(v)} written at {h(a)} ({k})")
+    if len(values) > 1:
+        raise Fail("size 'auto': several different SB_SECUR_EADR values found ("
+                   + ", ".join(h(v) for v in values) + "); give SIZE")
+    size = (values[0] & 0x1FFFFF) + 1
+    rep.set(eadr=h(values[0]), eadr_sites=[{"at": h(a), "kind": k} for a, _, k in hits])
+    rep.info(f"size (auto)      = {h(size)}")
+    if size not in (0x400, 0x200000):
+        rep.warn(f"checked size {h(size)} is not a Dreamcast/NAOMI size (0x400 / 0x200000); "
+                 "for Atomiswave the stored-value rule does not hold on official BIOSes, "
+                 "so a patched file is unlikely to pass")
+    return size
+
+
 # --------------------------------------------------------------------------- NAOMI reference
 
 FAR_REFERENCE = 0x1000     # warn if the closest reference differs by more bytes than this
@@ -483,7 +556,9 @@ def parse_args():
     p.add_argument("output", nargs="?",
                    help="output file (patched copy, must differ from the input); "
                         "not needed with --verify")
-    p.add_argument("size", type=integer, help="BIOS image size (decimal or 0x..)")
+    p.add_argument("size", type=lambda x: 'auto' if x.lower() == 'auto' else int(x, 0),
+                   help="checked BIOS size (decimal or 0x..), or 'auto' to read it from the "
+                        "SB_SECUR_EADR write in the boot code")
     p.add_argument("--base", type=integer, default=0,
                    help="start of the BIOS image in the file (default 0x0)")
     p.add_argument("--verify", action="store_true",
@@ -525,6 +600,10 @@ def run(args, rep):
     src = open(args.image, 'rb').read()
     image = bytearray(src)
     base, size = args.base, args.size
+    if size == 'auto':
+        if not 0 <= base < len(image):
+            raise Fail(f"--base {h(base)} is outside the file")
+        size = detect_size(image[base:], rep)
     if base < 0 or not 2 < size or base + size > len(image):
         raise Fail(f"BIOS image [{h(base)}, {h(base + size)}) does not fit in the file "
                    f"({h(len(image))} bytes)")
