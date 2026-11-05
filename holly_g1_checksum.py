@@ -11,8 +11,9 @@ HOLLY G1 check (validated against 68,245 tests on real hardware):
 Checked size ('auto'):
   Every HOLLY/CLX2 BIOS writes the last address of the checked area to SB_SECUR_EADR
   (0x005F74E4). With SIZE = auto, the script finds that write in the boot code (including
-  the hidden NAOMI loader at 0xE0, stored with its halfwords or longwords reversed) and
-  uses value + 1. Found in all 47 BIOSes tested: Dreamcast / NAOMI / NAOMI 2 0x1FFFFF,
+  the hidden loader at 0xE0, stored with its halfwords or longwords reversed) and
+  uses value + 1. It also follows loaders the boot code builds in RAM (Develop BIOS).
+  Found in all 50 BIOSes tested: Dreamcast / NAOMI / NAOMI 2 0x1FFFFF, Develop 0x3FF,
   Atomiswave 0xA677 (bios0/bios1) and 0xA673 (fpr-24363, BIOS at 0x60000).
 
 BIOS image location inside the file:
@@ -431,35 +432,138 @@ def write_temp(path, data):
 # Every HOLLY/CLX2 BIOS writes the LAST address of the checked area to SB_SECUR_EADR
 # (0x005F74E4) before reading it (see MAME dccons_m.cpp). SIZE = value + 1.
 EADR_PHYS = 0x005F74E4
+M32 = 0xFFFFFFFF
+
+
+def _s8(i8):
+    return i8 - 256 if i8 > 127 else i8
+
 
 def _decode_eadr_writes(code, base_addr, lo, hi):
-    """Linear scan of SH-4 code; track r0-r15 from PC-relative literals / mov #imm / add #imm /
-    mov rm,rn, and report every 'mov.l rX,@rY' where rY holds an SB_SECUR_EADR address."""
+    """Linear scan of SH-4 code tracking register constants (literals, immediates, shifts,
+    logic, GBR) and reporting every 32-bit store to SB_SECUR_EADR: (address, value)."""
     regs = [None] * 16
+    gbr = None
     out = []
+    mem = {}                                                  # RAM built by the code itself
+
+    def store(addr, val, pc):
+        if addr is not None and val is not None and addr & 0x1FFFFFFF == EADR_PHYS:
+            out.append((base_addr + pc, val & M32))
+
     for pc in range(lo, min(hi, len(code) - 1), 2):
         op = struct.unpack_from('<H', code, pc)[0]
-        n, m, i8 = (op >> 8) & 15, (op >> 4) & 15, op & 0xFF
-        if op >> 12 == 0xD:                                   # mov.l @(disp,PC),Rn
+        n, m, i8, top = (op >> 8) & 15, (op >> 4) & 15, op & 0xFF, op >> 12
+        rn, rm = regs[n], regs[m]
+        r = regs
+        if top == 0xD:                                        # mov.l @(disp,PC),Rn
             a = (pc & ~3) + 4 + i8 * 4
-            regs[n] = struct.unpack_from('<I', code, a)[0] if a + 4 <= len(code) else None
-        elif op >> 12 == 0xE:                                 # mov #imm,Rn
-            regs[n] = (i8 - 256 if i8 > 127 else i8) & 0xFFFFFFFF
-        elif op >> 12 == 0x7 and regs[n] is not None:         # add #imm,Rn
-            regs[n] = (regs[n] + (i8 - 256 if i8 > 127 else i8)) & 0xFFFFFFFF
-        elif op & 0xF00F == 0x6003:                           # mov Rm,Rn
-            regs[n] = regs[m]
+            r[n] = struct.unpack_from('<I', code, a)[0] if a + 4 <= len(code) else None
+        elif top == 0x9:                                      # mov.w @(disp,PC),Rn
+            a = pc + 4 + i8 * 2
+            r[n] = (_s8(0) + struct.unpack_from('<h', code, a)[0]) & M32 if a + 2 <= len(code) else None
+        elif top == 0xE:                                      # mov #imm,Rn
+            r[n] = _s8(i8) & M32
+        elif top == 0x7:                                      # add #imm,Rn
+            r[n] = (rn + _s8(i8)) & M32 if rn is not None else None
+        elif op >> 8 == 0xCB:                                 # or #imm,R0
+            r[0] = r[0] | i8 if r[0] is not None else None
+        elif op >> 8 == 0xC9:                                 # and #imm,R0
+            r[0] = r[0] & i8 if r[0] is not None else None
+        elif op >> 8 == 0xCA:                                 # xor #imm,R0
+            r[0] = r[0] ^ i8 if r[0] is not None else None
+        elif op >> 8 == 0xC2:                                 # mov.l R0,@(disp,GBR)
+            store((gbr + i8 * 4) if gbr is not None else None, r[0], pc)
+        elif op >> 8 in (0xC6, 0xC4, 0xC5):                   # mov.x @(disp,GBR),R0
+            r[0] = None
+        elif top == 0x1:                                      # mov.l Rm,@(disp,Rn)
+            store((rn + (op & 15) * 4) if rn is not None else None, rm, pc)
         elif op & 0xF00F == 0x2002:                           # mov.l Rm,@Rn
-            if regs[n] is not None and regs[n] & 0x1FFFFFFF == EADR_PHYS and regs[m] is not None:
-                out.append((base_addr + pc, regs[m]))
-        elif op in (0x000B, 0x002B) or op >> 12 in (0xA, 0xB) or op & 0xF0FF in (0x402B, 0x400B):
-            regs = [None] * 16                                # rts / bra / jmp / jsr: forget state
+            store(rn, rm, pc)
+            if rn is not None and rm is not None:
+                mem[rn & 0x1FFFFFFF] = rm
+        elif op & 0xF00F == 0x2006:                           # mov.l Rm,@-Rn (push)
+            if rn is not None:
+                r[n] = (rn - 4) & M32
+                store(r[n], rm, pc)
+                if rm is not None:
+                    mem[r[n] & 0x1FFFFFFF] = rm
+        elif op & 0xF00F == 0x6003:                           # mov Rm,Rn
+            r[n] = rm
+        elif op & 0xF00F == 0x300C:                           # add Rm,Rn
+            r[n] = (rn + rm) & M32 if None not in (rn, rm) else None
+        elif op & 0xF00F == 0x3008:                           # sub Rm,Rn
+            r[n] = (rn - rm) & M32 if None not in (rn, rm) else None
+        elif op & 0xF00F == 0x200B:                           # or
+            r[n] = rn | rm if None not in (rn, rm) else None
+        elif op & 0xF00F == 0x2009:                           # and
+            r[n] = rn & rm if None not in (rn, rm) else None
+        elif op & 0xF00F == 0x200A:                           # xor
+            r[n] = rn ^ rm if None not in (rn, rm) else None
+        elif op & 0xF00F == 0x6009:                           # swap.w
+            r[n] = ((rm >> 16) | (rm << 16)) & M32 if rm is not None else None
+        elif op & 0xF00F == 0x6008:                           # swap.b
+            r[n] = (rm & 0xFFFF0000) | ((rm & 0xFF) << 8) | ((rm >> 8) & 0xFF) if rm is not None else None
+        elif op & 0xF00F == 0x600C:                           # extu.b
+            r[n] = rm & 0xFF if rm is not None else None
+        elif op & 0xF00F == 0x600D:                           # extu.w
+            r[n] = rm & 0xFFFF if rm is not None else None
+        elif op & 0xF00F == 0x6007:                           # not
+            r[n] = ~rm & M32 if rm is not None else None
+        elif op & 0xF0FF in (0x4000, 0x4008, 0x4018, 0x4028, 0x4020):   # shll, 2, 8, 16, shal
+            k = {0x4000: 1, 0x4008: 2, 0x4018: 8, 0x4028: 16, 0x4020: 1}[op & 0xF0FF]
+            r[n] = (rn << k) & M32 if rn is not None else None
+        elif op & 0xF0FF in (0x4001, 0x4009, 0x4019, 0x4029):           # shlr, 2, 8, 16
+            k = {0x4001: 1, 0x4009: 2, 0x4019: 8, 0x4029: 16}[op & 0xF0FF]
+            r[n] = rn >> k if rn is not None else None
+        elif op & 0xF0FF == 0x401E:                           # ldc Rn,GBR
+            gbr = rn
+        elif op & 0xF0FF == 0x0012:                           # stc GBR,Rn
+            r[n] = gbr
+        elif op & 0xF0FF == 0x4010:                           # dt
+            r[n] = (rn - 1) & M32 if rn is not None else None
+        elif op in (0x000B, 0x002B) or top in (0xA, 0xB) or op & 0xF0FF in (0x402B, 0x400B):
+            regs = [None] * 16                                # rts / bra / jmp / jsr
+            r = regs
+        elif top in (0x6, 0x0, 0x3, 0x4, 0x5, 0x2, 0x8, 0xC, 0xF):
+            # anything else that may write Rn (loads, mul, movt, etc.): forget Rn conservatively
+            if top in (0x6, 0x5) or (top == 0 and op & 0xF in (0x9, 0xA, 0xC, 0xD, 0xE)):
+                r[n] = None
+            elif top == 0x8 and n in (0x4, 0x5):              # mov.b/w @(disp,Rm),R0
+                r[0] = None
+            elif top == 0x3 and op & 0xF in (0x4, 0x5, 0x7, 0xA, 0xB, 0xD, 0xE, 0xF):
+                r[n] = None
+            elif top == 0x4 and op & 0xFF in (0x05, 0x04, 0x24, 0x25, 0x21, 0x0C, 0x1C, 0x2C, 0x2A,
+                                                0x0A, 0x1A, 0x06, 0x16, 0x26):
+                if op & 0xFF in (0x05, 0x04, 0x24, 0x25, 0x21, 0x0C, 0x1C, 0x2C):
+                    r[n] = None
+    _decode_eadr_writes.mem = mem
     return out
+
+
+def _ram_blocks(mem):
+    """Contiguous longword blocks written to RAM by the scanned code: [(addr, bytes)]."""
+    blocks, cur, start = [], None, None
+    for a in sorted(mem):
+        if cur is not None and a == start + len(cur):
+            cur += struct.pack('<I', mem[a])
+        else:
+            if cur:
+                blocks.append((start, cur))
+            start, cur = a, bytearray(struct.pack('<I', mem[a]))
+    if cur:
+        blocks.append((start, cur))
+    return [(a, bytes(b)) for a, b in blocks if len(b) >= 8]
+
 
 def find_eadr(bios, scan=0x1000):
     """Return [(where, value, kind)] for SB_SECUR_EADR writes in the boot code.
-    Also decodes the NAOMI-style hidden loader: 16 halfwords at 0xE0 stored in reverse order."""
+    Also decodes the hidden loader at 0xE0 (NAOMI / early Dreamcast), stored with its
+    halfwords or longwords in reverse order."""
     hits = [(pc, v, 'boot code') for pc, v in _decode_eadr_writes(bios, 0, 0, scan)]
+    for addr, blob in _ram_blocks(_decode_eadr_writes.mem):  # loader built in RAM (Develop)
+        hits += [(pc | 0xA0000000, v, f'RAM loader built by the boot code at {addr | 0xA0000000:08X}')
+                 for pc, v in _decode_eadr_writes(blob + bytes(64), addr, 0, len(blob))]
     if len(bios) >= 0x100:
         h = struct.unpack_from('<16H', bios, 0xE0)
         w = struct.unpack_from('<8I', bios, 0xE0)
