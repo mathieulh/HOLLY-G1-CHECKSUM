@@ -1,17 +1,20 @@
 # HOLLY G1 Checksum
 
-Patch a Dreamcast BIOS image so its **HOLLY G1 checksum** comes out at `0x0000` (or another
-target). You can change bytes anywhere in the image; the script then corrects the checksum by
-writing **3 bytes** at the end of a small free area just before the last 2 bytes of the image.
+Patch a Dreamcast BIOS image so it passes HOLLY's **G1 checksum check**. You can change bytes
+anywhere in the image; the script then corrects the checksum by writing **3 bytes** at the end
+of a small free area just before the last 2 bytes of the image.
 
-If the parity/checksum does not pass HOLLY's verification the G1 bus (GD ROM on Dreamcast, CART/DIMM on NAOMI)
-remains in a locked state, only after the check pass does the G1 bus become unlocked.
+At boot, HOLLY computes a checksum over the BIOS and compares it with the **stored value** in
+the last 2 bytes of the image. If they don't match, the G1 bus (GD-ROM on Dreamcast,
+cartridge/DIMM on NAOMI) stays locked. The bus is only unlocked once the check passes.
 
 - Works on an already modified BIOS, or applies your changes for you (`--write` / `--file`)
-- With the default settings, always reaches `0x0000` (checked for every possible checksum state)
+- With the default settings, always reaches a stored value of `0x0000` (checked for every possible checksum state)
+- Can also set a new stored value (`--set-stored`)
 - Changes as few bytes as possible
 - Refuses to overwrite real data or to write over the input file
 - Can also produce an **IPS** or **BPS** patch, so you can share changes without the BIOS
+- Checked against **68,245 tests on real hardware** (see [Validation on hardware](#validation-on-hardware))
 
 > **NAOMI:** the size and offset of the area HOLLY checks in the NAOMI BIOS are **not known**.
 > This tool cannot be used to patch NAOMI BIOSes until those values are known.
@@ -55,7 +58,7 @@ The input file is never modified.
 | BIOS | `SIZE` | Status |
 |---|---|---|
 | Retail Dreamcast BIOS | `0x200000` | Supported |
-| NAOMI / Dreamcast **Develop** BIOS | `0x400` | Supported |
+| NAOMI / Dreamcast **Develop** BIOS | `0x400` | Supported, validated on hardware |
 | NAOMI BIOS | unknown | **Not supported**: the size and offset of the checked area are not known |
 
 For the NAOMI BIOS, guessing values will produce a file whose checksum is "correct" for the
@@ -80,21 +83,31 @@ Numbers can be written in decimal or hex (`1024`, `0x400`).
 
 | Option | Default | Description |
 |---|---|---|
-| `--verify` | | Only check the checksum of the input. Writes nothing. |
+| `--verify` | | Only check the input: checksum must equal the stored value. Writes nothing. |
 | `--write OFF=HEX` | | Write hex bytes at offset `OFF`. Repeatable. Spaces are allowed if the argument is quoted. |
 | `--file OFF=PATH` | | Write the contents of a file at offset `OFF`. Repeatable. |
+| `--set-stored VALUE` | | Write a new stored value (16-bit, little-endian) to the last 2 bytes, and patch the checksum to match it. |
 | `--base OFF` | `0x0` | Where the BIOS image starts inside the file. |
 | `--free-area N` | `8` | Size of the free area, in bytes, just before the last 2 bytes of the image. |
 | `--offset OFF` | end of free area | Place the patch at a specific offset inside the free area. |
 | `--length N` | `3` (at end), `4` (with `--offset`) | Patch length, 1 to 6 bytes. Fewer than 3 bytes can fail. |
 | `--force` | | Allow the patch to overwrite non-padding bytes, and allow a `SIZE` above `0x200000`. A warning is still printed. |
 | `--patch-file PATH` | | Also write an IPS (`.ips`) or BPS (`.bps`) patch from input to output. |
-| `--target VALUE` | `0x0000` | Checksum value to reach. |
 | `--init VALUE` | `0x0000` | Initial value of the checksum accumulator. |
 | `--quiet` | | Print only warnings and errors. |
 | `--json` | | Print a single JSON result object (also on errors). |
 
 `--quiet` and `--json` cannot be used together.
+
+### The stored value
+
+The last 2 bytes of the image hold the value HOLLY expects, in little-endian order
+(`00 00` = `0x0000`, `34 12` = `0x1234`). The script always patches the checksum to match
+the stored value **after** your changes are applied:
+
+- By default the stored value is left as it is. Most BIOSes end in `00 00`, so the target is `0x0000`.
+- `--set-stored 0x1234` writes `34 12` to the last 2 bytes and patches the checksum to `0x1234`.
+- A `--write` that changes the last 2 bytes also changes the target.
 
 ### Offsets, size and base
 
@@ -105,13 +118,15 @@ the BIOS image**, not the file. When `--base` is not 0, messages also show the f
 file   |-------------------------------- file size --------------------------------|
 image          |<------------------------------ SIZE ----------------------------->|
                ^ --base
-               |<------------- checked: first SIZE - 2 bytes ------------->|<-2 B->|
+               |<------------- checked: first SIZE - 2 bytes ------------->|stored |
                                                        |<--- free area --->|
                                                                  |<-patch->|
 ```
 
 - The checksum covers the first `SIZE - 2` bytes of the image. The free area and the patch
-  are **inside** that range. The last 2 bytes are not checked and are never touched.
+  are **inside** that range.
+- The last 2 bytes are the stored value. They are not part of the checksum, and the script
+  only changes them if you ask it to (`--set-stored` or `--write`).
 - The free area is `[SIZE - 2 - free_area, SIZE - 2)`.
 - The default patch is the last 3 bytes of the free area: `SIZE - 5` to `SIZE - 3`.
 - Everything outside the image is copied to the output unchanged.
@@ -127,7 +142,7 @@ python3 holly_g1_checksum.py test.bin out.bin 0x400
 | Checked area | `0x000`–`0x3FD` |
 | Free area (8 bytes) | `0x3F6`–`0x3FD` |
 | Patch (3 bytes) | `0x3FB`–`0x3FD` |
-| Not checked, never touched | `0x3FE`–`0x3FF` |
+| Stored value | `0x3FE`–`0x3FF` |
 | Copied unchanged | `0x400`–`0x1FFFFF` |
 
 ### Example output
@@ -135,11 +150,11 @@ python3 holly_g1_checksum.py test.bin out.bin 0x400
 ```
 file             = 0x200000 bytes, BIOS image = 0x0 .. 0x3FF (the rest is copied unchanged)
 free area        = 0x3F6 .. 0x3FD (inclusive)
-write @ 0x10 : F9 C5 E7 20 -> DE AD BE EF
-checksum before  = 0xB768
-patch @ 0x3FB : FF FF FF -> 03 5B 7B (3 byte(s) changed)
+write @ 0x10 : 0A 27 FF C9 -> DE AD BE EF
+checksum before  = 0x733A, stored = 0x0000
+patch @ 0x3FB : FF FF FF -> 54 2C AD (3 byte(s) changed)
 patch file       = out.ips (25 bytes, verified)
-checksum after   = 0x0000 -> OK
+checksum after   = 0x0000, stored = 0x0000 -> OK
 ```
 
 Every change is shown as **old bytes → new bytes**. Long writes are shortened to the first
@@ -172,7 +187,8 @@ python3 holly_g1_checksum.py bios.bin out.bin 0x200000 --write 0x10=DEADBEEF --p
 
 The format comes from the file extension. Before saving, the script applies the patch to the
 input and checks that the result matches the output byte for byte. The patch contains every
-difference between the input and output files: your changes and the checksum patch.
+difference between the input and output files: your changes, the checksum patch and any
+change to the stored value.
 
 | Format | Notes |
 |---|---|
@@ -183,12 +199,12 @@ difference between the input and output files: your changes and the checksum pat
 
 | Exit code | Meaning |
 |---|---|
-| `0` | OK: checksum matches the target |
+| `0` | OK: checksum matches the stored value |
 | `1` | Failed or refused: checksum mismatch, safety check, I/O error |
 | `2` | Invalid command-line arguments |
 
 ```sh
-python3 holly_g1_checksum.py dump.bin out.bin 0x400 --base 0x10000 --write 0x5=AA --json
+python3 holly_g1_checksum.py bios.bin out.bin 0x400 --write 0x5=AA --json
 ```
 
 Example result (values depend on the input):
@@ -196,28 +212,48 @@ Example result (values depend on the input):
 ```json
 {
   "warnings": [],
-  "input": "dump.bin",
+  "input": "bios.bin",
   "size": "0x400",
-  "base": "0x10000",
-  "target": "0x0000",
+  "base": "0x0",
   "mode": "patch",
   "output": "out.bin",
   "free_area": ["0x3F6", "0x3FD"],
   "writes": [{"offset": "0x5", "length": "0x1"}],
-  "checksum_before": "0x028C",
+  "checksum_before": "0x72F6",
+  "stored": "0x0000",
   "patch": {
     "offset": "0x3FB",
-    "old": "00 00 00",
-    "new": "E4 E4 FE",
+    "old": "FF FF FF",
+    "new": "42 22 A3",
     "changed_bytes": 3,
-    "padding": "0x00"
+    "padding": "0xFF"
   },
   "checksum_after": "0x0000",
   "ok": true
 }
 ```
 
-On error, the object contains `"ok": false` and an `"error"` message.
+With `--verify`, the object contains `"mode": "verify"`, `"checksum"` and `"stored"`.
+On error, it contains `"ok": false` and an `"error"` message.
+
+### Validation on hardware
+
+`validate_g1_tests.py` replays a hardware test log against the script's checksum and prints
+how well they agree:
+
+```sh
+python3 validate_g1_tests.py g1test.bin tests_physiques_G1.txt --size 0x400
+```
+
+- The first argument is the base BIOS, as a `.bin` file or as a C array export (`.c`).
+- The test log has one test per line, in the format
+  `ADR=Llane OLD->NEW [; ADR=Llane OLD->NEW ...] || G1=OUVERT/FERME`
+  (`OUVERT` = open, `FERME` = closed).
+- For each test, the changes are applied to the base BIOS and the script predicts whether
+  G1 opens. The result is a confusion matrix, followed by the mismatches.
+
+The test logs contain Develop BIOS bytes and are **not** included in this repository.
+`validate_g1_tests.py` contains no BIOS data.
 
 ### Changing the defaults
 
@@ -232,9 +268,9 @@ MAX_BIOS_SIZE     = 0x200000  # largest expected BIOS size; above it --force is 
 
 ## Part 2 — How it works
 
-### The HOLLY G1 checksum
+### The HOLLY G1 check
 
-The checksum is computed over the first `SIZE - 2` bytes of the image with a 16-bit
+HOLLY computes a checksum over the first `SIZE - 2` bytes of the image, with a 16-bit
 accumulator `A` and a "sticky" fold value that is either `0` or `0x1104`.
 
 For each byte `b`:
@@ -244,6 +280,9 @@ For each byte `b`:
 2. **Add** `spread(b) XOR fold` to `A`.
 3. On **overflow** (`A ≥ 0x10000`), keep the low 16 bits and **toggle** `fold` between
    `0` and `0x1104`.
+
+G1 is unlocked if and only if the final `A` equals the **stored value**: the last 2 bytes of
+the image, little-endian.
 
 ```python
 FOLD = 0x1104                      # = spread(0x52)
@@ -262,10 +301,43 @@ def checksum(data, A=0):
             A &= 0xFFFF
             fold ^= FOLD
     return A
+
+def holly_check(image, size):
+    stored = image[size - 2] | image[size - 1] << 8
+    return checksum(image[:size - 2]) == stored
 ```
 
-A valid image gives `0x0000`. Unmodified retail Dreamcast BIOSes give `0x0000` over
-`0x200000` bytes.
+Unmodified retail Dreamcast BIOSes give `0x0000` over `0x200000` bytes.
+
+### Validation on hardware
+
+The algorithm was checked against **68,245 unique tests** run on real hardware with a
+`0x400` Develop BIOS (see [Contribution](#contribution)):
+
+| | Hardware: G1 open | Hardware: G1 closed |
+|---|---|---|
+| Predicted open | **10,169** | 208 |
+| Predicted closed | **0** | **57,868** |
+
+- **Every opening was predicted:** no test opened when the algorithm said it should not.
+- **Excluding byte `0xFC`, the agreement is 100%** (67,802 tests).
+- **Comparing with the stored value is required.** Two tests opened with a non-zero stored
+  value (`0x0001` and `0xB000`), each with a matching checksum. A fixed target of `0x0000`
+  would get 275 tests wrong instead of 208.
+
+**The `0xFC` exceptions.** All 208 mismatches change byte `0xFC` of the Develop BIOS, and in
+all of them G1 stayed closed although the checksum matched. These are most likely not checksum
+failures: `0xFC`–`0xFF` appears to be code that the test BIOS runs, so changing it stops the
+BIOS before it can report. This is an interpretation, not a proven fact. It is based on the
+following:
+
+- These tests change `0xFC` to a value `x` and the next byte to its complement, which keeps
+  the checksum the same. Some values of `x` open and some don't, so the checksum is not what
+  decides.
+- Bit 0 of `x` never changes the result. Which values open seems to follow how the 16-bit word
+  would decode as an SH-4 instruction.
+- The result depends only on the 4 bytes at `0xFC`–`0xFF`: tests with the same values there
+  never gave different results.
 
 ### The state space
 
@@ -310,25 +382,30 @@ to an arbitrary value, whatever its content or length: the bytes after it decide
 The exact limit depends on the data, roughly 64 to 128 bytes in this test.
 
 The fix is to put the patch **last**, with nothing after it in the checked area. That is why
-the default patch is at `SIZE - 5` to `SIZE - 3`, just before the 2 unchecked bytes. Your own
+the default patch is at `SIZE - 5` to `SIZE - 3`, just before the stored value. Your own
 changes can then go anywhere.
 
 ### Why 3 bytes
 
-| Patch length at the end | Starting states that can reach `0x0000` |
+| Patch length at the end | Result |
 |---|---|
-| 2 bytes | about 7% (random sample of 200 states) |
-| **3 bytes** | **131,072 / 131,072 (exhaustive check)** |
+| 2 bytes | `0x0000` reachable from about 7% of starting states (random sample of 200 states) |
+| **3 bytes** | **`0x0000` reachable from all 131,072 / 131,072 states (exhaustive check)** |
+| **3 bytes** | **all 65,536 values reachable** from each of 150 sampled starting states |
 
 Each byte adds one of only 256 values between `0` and `0x5555`, so 2 bytes give too few
-combinations to hit an exact 16-bit target from most states. With 3 bytes, every one of the
+combinations to hit an exact 16-bit value from most states. With 3 bytes, every one of the
 131,072 states was checked and all of them can reach `0x0000`. This is why the default patch
-always succeeds, and why an 8-byte (64-bit) free area is more than enough.
+always succeeds for a stored value of `0x0000`, and why an 8-byte (64-bit) free area is more
+than enough.
 
-The exhaustive check was done for target `0x0000`. Other `--target` values usually work but
-are not guaranteed.
+For other stored values, the check was done on a sample of starting states rather than all of
+them. Every sampled state could reach every value, so other stored values are expected to work,
+but this is not proven for every state.
 
 ### Finding the patch
+
+The target `T` is the stored value, read after your changes are applied.
 
 **Patch at the end (default).** The first `length - 1` bytes are searched; the last one is
 computed directly.
@@ -337,7 +414,7 @@ computed directly.
 2. For each patch byte except the last, extend every current state with all 256 byte values,
    then **merge identical states**. This keeps the search to at most 131,072 states per step,
    whatever the length.
-3. For the last byte, solve for it instead of trying all values. To reach target `T`:
+3. For the last byte, solve for it instead of trying all values. To reach `T`:
 
 $$
 A + (\text{spread}(b) \oplus \text{fold}) = T \quad\text{or}\quad T + \texttt{0x10000}
@@ -372,9 +449,10 @@ reports `(unchanged)`.
 
 ### Writing the output safely
 
-1. Copy the input in memory, apply `--write` / `--file`, then apply the patch.
+1. Copy the input in memory, apply `--write` / `--file` / `--set-stored`, then apply the patch.
 2. Write the result to a temporary file in the output directory and flush it to disk (`fsync`).
-3. Read the temporary file back and check its content and checksum.
+3. Read the temporary file back and check its content, and that the checksum equals the
+   stored value.
 4. If requested, build the IPS/BPS patch, apply it to the input in memory and check it gives
    exactly the output.
 5. Rename the temporary file(s) to the final name in one step (`os.replace`).
@@ -394,7 +472,8 @@ If any step fails, the temporary files are deleted.
 
 ## Contribution
 
-The checksum algorithm was worked out from close to **70,000 tests on real hardware**.
+The checksum algorithm was worked out from close to **70,000 tests on real hardware**
+(68,245 unique tests after removing duplicates).
 
 The test setup:
 
@@ -405,7 +484,9 @@ The test setup:
 
 Each test took about **7 seconds**, so 70,000 tests add up to roughly **136 hours** (about
 5.7 days) of continuous hardware testing. The results of these tests are what made it possible
-to reduce the checksum to the algorithm in [Part 2](#part-2--how-it-works).
+to reduce the checksum to the algorithm in [Part 2](#part-2--how-it-works), and they are what
+the script is [validated against](#validation-on-hardware-1).
+
 
 <img width="3840" height="2891" alt="s2ohdlx04cxh1" src="https://github.com/user-attachments/assets/834f86ad-20c7-4aa4-b8d9-6b05ffeed8ec" />
 
@@ -413,9 +494,6 @@ to reduce the checksum to the algorithm in [Part 2](#part-2--how-it-works).
 ## Contributors
 
 - [Guimli/Nicolas Weill](https://github.com/Guimli)
-
-* Ran all the tests and designed the custom hardware, worked on the algorithm
-
+  - Ran all the tests and designed the custom hardware, worked on the algorithm
 - [Mathieulh](https://github.com/Mathieulh)
-
-* Worked on the algorithm, wrote the script, tested across all 131,072 states over 0x200000 bytes
+  - Worked on the algorithm, wrote the script, tested across all 131,072 states over 0x200000 bytes
