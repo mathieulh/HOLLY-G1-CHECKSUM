@@ -37,6 +37,16 @@ Safety:
   - the output must differ from the input; it is written to a temporary file,
     verified, then renamed (a crash never leaves a half-written output).
 
+NAOMI BIOS (--reference REF):
+  NAOMI BIOSes do NOT store the expected value in their last 2 bytes. The checksum runs
+  over all 'size' bytes (0x200000), and every official BIOS of the same version ends in the
+  same final state; Sega tunes the last 6 bytes of each region variant to keep it. With
+  --reference, the script makes the modified BIOS reach the same final state (checksum
+  and fold) as REF, an unmodified BIOS of the same version, by patching its last 4 bytes.
+  REF can be a directory of unmodified BIOSes: the one closest to the input (fewest
+  differing bytes) is picked automatically.
+  Whether HOLLY accepts the result has not been tested on hardware.
+
 Optional patch file (--patch-file): IPS (.ips) or BPS (.bps) patch from the input
 to the output, so changes can be shared without distributing the BIOS.
 
@@ -48,6 +58,7 @@ Examples:
   holly_g1_checksum.py bios.bin out.bin 0x200000 --file 0x8000=logo.bin --patch-file out.bps
   holly_g1_checksum.py dump.bin out.bin 0x400 --base 0x10000 --json
   holly_g1_checksum.py bios.bin 0x400 --verify
+  holly_g1_checksum.py naomi.bin 0x200000 --verify --reference naomi_bioses/
 """
 import argparse
 import json
@@ -64,6 +75,7 @@ FOLD = 0x1104              # fold pattern = spread(0x52)
 PREVIEW = 16               # max bytes shown for user writes
 PADDING = (0x00, 0xFF)
 MAX_LENGTH = 6             # max patch length (search cost grows quickly)
+SEGA_TUNE = 6              # NAOMI: last bytes Sega tunes to keep the checksum per version
 
 
 class Fail(Exception):
@@ -154,8 +166,9 @@ def _extend(keys, cost, patches, bcost):
     return nk[sel], nc[sel], np.hstack([patches[parent], val[:, None]])
 
 
-def solve_at_end(A, fold, old, pad, target):
-    """Patch followed by NO bytes: (len-1) bytes searched, last byte computed directly."""
+def solve_at_end(A, fold, old, pad, target, target_fold=None):
+    """Patch followed by NO bytes: (len-1) bytes searched, last byte computed directly.
+    If target_fold is given (0 or FOLD), the final fold must match it too."""
     keys, cost, patches = _start(A, fold)
     for i in range(len(old) - 1):
         keys, cost, patches = _extend(keys, cost, patches, byte_cost(old[i], pad))
@@ -168,6 +181,8 @@ def solve_at_end(A, fold, old, pad, target):
         ok = (x >= 0) & (x <= 0x5555)
         b = INV[np.where(ok, x, 0) ^ f]
         ok &= b >= 0
+        if target_fold is not None:            # fold after the last byte must match
+            ok &= (f ^ (FOLD if base > 0xFFFF else 0)) == target_fold
         i = np.nonzero(ok)[0]
         if len(i):
             total = cost[i] + last[b[i]]
@@ -177,7 +192,7 @@ def solve_at_end(A, fold, old, pad, target):
     return best[1] if best else None
 
 
-def solve_in_middle(A, fold, old, pad, rest, target):
+def solve_in_middle(A, fold, old, pad, rest, target, target_fold=None):
     """Patch followed by the (kept) bytes 'rest': search + propagation."""
     keys, cost, patches = _start(A, fold)
     for i in range(len(old)):
@@ -188,7 +203,10 @@ def solve_in_middle(A, fold, old, pad, rest, target):
         keys = (a & 0xFFFF) | (((keys >> 16) ^ (a >= 0x10000)) << 16)
         sel = _dedup_min(keys, cost)
         keys, cost, rep = keys[sel], cost[sel], rep[sel]
-    i = np.nonzero((keys & 0xFFFF) == target)[0]
+    match = (keys & 0xFFFF) == target
+    if target_fold is not None:
+        match &= (keys >> 16) == (target_fold != 0)
+    i = np.nonzero(match)[0]
     if not len(i):
         return None
     return bytes(patches[rep[i[np.argmin(cost[i])]]])
@@ -377,6 +395,51 @@ def write_temp(path, data):
     return tmp
 
 
+# --------------------------------------------------------------------------- NAOMI reference
+
+FAR_REFERENCE = 0x1000     # warn if the closest reference differs by more bytes than this
+
+
+def find_reference(path, bios, base, size, init, rep):
+    """Resolve --reference. A file is used as is. For a directory, every file large enough
+    is compared with 'bios' (the input, before any change) and the one with the fewest
+    differing bytes in [base, base + size) is used. Returns (path, A, fold)."""
+    if not os.path.isdir(path):
+        ref = open(path, 'rb').read()
+        if base + size > len(ref):
+            raise Fail(f"reference image [{h(base)}, {h(base + size)}) does not fit in "
+                       f"{path} ({h(len(ref))} bytes)")
+        A, fold = state(ref[base:base + size], init)
+        rep.set(reference=path)
+        return path, A, fold
+
+    mine = np.frombuffer(bytes(bios), np.uint8)
+    candidates = []                             # (differing bytes, path, region)
+    for name in sorted(os.listdir(path)):
+        f = os.path.join(path, name)
+        if not os.path.isfile(f) or os.path.getsize(f) < base + size:
+            continue
+        region = open(f, 'rb').read()[base:base + size]
+        dist = int(np.count_nonzero(np.frombuffer(region, np.uint8) != mine))
+        candidates.append((dist, f, region))
+    if not candidates:
+        raise Fail(f"no file of at least {h(base + size)} bytes in {path}")
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    dist, best, region = candidates[0]
+    A, fold = state(region, init)
+
+    # every reference ending on the same state (same group) - informative only
+    group = [os.path.basename(f) for d, f, r in candidates if state(r, init) == (A, fold)]
+    rep.set(reference=best, reference_distance=dist, reference_group=group)
+    rep.info(f"reference        = {os.path.basename(best)} (closest of {len(candidates)}, "
+             f"{dist} byte(s) differ)")
+    rep.info(f"same final state = {', '.join(group)}")
+    if dist > FAR_REFERENCE:
+        rep.warn(f"the closest reference differs by {dist} bytes: the input may not be a "
+                 f"version present in {path}")
+    return best, A, fold
+
+
 # --------------------------------------------------------------------------- main
 
 def integer(x):
@@ -423,6 +486,11 @@ def parse_args():
                         "above 0x200000")
     p.add_argument("--patch-file", metavar="PATH",
                    help="also write an IPS (.ips) or BPS (.bps) patch from input to output")
+    p.add_argument("--reference", metavar="REF",
+                   help="NAOMI mode: checksum ALL 'size' bytes (no stored value) and match the "
+                        "final checksum state of REF, an unmodified BIOS of the same version. "
+                        "REF can be a file, or a DIRECTORY of unmodified BIOSes: the closest "
+                        "one (fewest differing bytes) is then picked automatically")
     p.add_argument("--init", type=integer, default=0, help="initial state A (default 0)")
     out = p.add_mutually_exclusive_group()
     out.add_argument("--quiet", action="store_true", help="print only warnings and errors")
@@ -442,8 +510,16 @@ def run(args, rep):
         if not args.force:
             raise Fail(msg + ". Check the size argument, or use --force to bypass the limit.")
         rep.warn(msg + " (--force)")
-    zone = size - 2                             # checked area: [0, zone) relative to base
+    naomi = args.reference is not None
+    if naomi and args.set_stored is not None:
+        raise Fail("--set-stored cannot be used with --reference (no stored value)")
+    # checked area: [0, zone) relative to base. Retail/Develop: size - 2 (stored value
+    # follows). NAOMI (--reference): the whole image, compared with the reference state.
+    zone = size if naomi else size - 2
     free_start = zone - args.free_area
+    if naomi:
+        ref_path, ref_A, ref_fold = find_reference(args.reference, image[base:base + size],
+                                                   base, size, args.init, rep)
     if free_start < 0:
         raise Fail("free area larger than the checked area")
 
@@ -464,6 +540,14 @@ def run(args, rep):
                 args.set_stored is not None:
             rep.warn("--verify ignores the output, --write, --file, --set-stored "
                      "and --patch-file")
+        if naomi:
+            c, f = state(bios(), args.init)
+            ok = (c, f) == (ref_A, ref_fold)
+            rep.set(mode="verify", checksum=h4(c), fold=h4(f), reference=ref_path,
+                    reference_checksum=h4(ref_A), reference_fold=h4(ref_fold))
+            rep.info(f"checksum         = {h4(c)} (fold {h4(f)}), reference = {h4(ref_A)} "
+                     f"(fold {h4(ref_fold)}) -> {'OK' if ok else 'FAIL'}")
+            return ok
         ok, c, s = holly_check(bios(), size, args.init)
         rep.set(mode="verify", checksum=h4(c), stored=h4(s))
         rep.info(f"checksum         = {h4(c)}, stored = {h4(s)} -> {'OK' if ok else 'FAIL'}")
@@ -499,12 +583,16 @@ def run(args, rep):
         rep.info(f"write @ {fo(o)} : {hexstr(old, PREVIEW)} -> {hexstr(d, PREVIEW)}")
     rep.set(writes=[{"offset": h(o), "length": h(len(d))} for o, d in writes])
 
-    # 2. Target = stored value (last 2 bytes, after the user changes)
-    target = stored_value(bios(), size)
+    # 2. Target: stored value (last 2 bytes, after the user changes), or with
+    #    --reference the final state (checksum and fold) of the reference BIOS
+    if naomi:
+        target, target_fold = ref_A, ref_fold
+    else:
+        target, target_fold = stored_value(bios(), size), None
 
     # 3. Patch position
     at_end = args.offset is None
-    length = args.length or (3 if at_end else 4)
+    length = args.length or (4 if naomi or not at_end else 3)
     if not 1 <= length <= MAX_LENGTH:
         raise Fail(f"--length must be between 1 and {MAX_LENGTH}")
     offset = zone - length if at_end else args.offset
@@ -516,8 +604,9 @@ def run(args, rep):
             raise Fail(f"the write at {h(o)} overlaps the patch at {h(offset)}")
 
     before = checksum(image[base:base + zone], args.init)
-    rep.set(checksum_before=h4(before), stored=h4(target))
-    rep.info(f"checksum before  = {h4(before)}, stored = {h4(target)}")
+    label = "reference" if naomi else "stored"
+    rep.set(checksum_before=h4(before), **{label: h4(target)})
+    rep.info(f"checksum before  = {h4(before)}, {label} = {h4(target)}")
 
     # 4. Compute the patch (fewest changed bytes, then closest to padding)
     free = image[base + free_start:base + zone]
@@ -526,16 +615,18 @@ def run(args, rep):
     A, fold = state(image[base:base + offset], args.init)
     rest = bytes(image[base + offset + length:base + zone])
     if rest:
-        patch = solve_in_middle(A, fold, old, pad, rest, target)
+        patch = solve_in_middle(A, fold, old, pad, rest, target, target_fold)
     else:
-        patch = solve_at_end(A, fold, old, pad, target)
+        patch = solve_at_end(A, fold, old, pad, target, target_fold)
     if patch is None:
         raise Fail(f"no patch found at {h(offset)}. Omit --offset to place the patch "
                    "at the end of the free area.")
     changed = sum(a != b for a, b in zip(old, patch))
 
     # 5. Overwrite protection: changed bytes must be padding unless --force
-    data = [i for i in range(length) if patch[i] != old[i] and old[i] not in PADDING]
+    # (NAOMI: the last SEGA_TUNE bytes are Sega's own compensation bytes, not data)
+    data = [i for i in range(length) if patch[i] != old[i] and old[i] not in PADDING
+            and not (naomi and offset + i >= size - SEGA_TUNE)]
     if data:
         msg = (f"the patch overwrites non-padding bytes at "
                f"{', '.join(h(offset + i) for i in data)} ({hexstr(old)})")
@@ -553,10 +644,14 @@ def run(args, rep):
     tmp = write_temp(args.output, image)
     try:
         written = open(tmp, 'rb').read()
-        ok, after, stored = holly_check(written[base:base + size], size, args.init)
+        if naomi:
+            after, f = state(written[base:base + size], args.init)
+            ok, stored = (after, f) == (ref_A, ref_fold), ref_A
+        else:
+            ok, after, stored = holly_check(written[base:base + size], size, args.init)
         if written != image or not ok:
             raise Fail(f"verification of the written file failed "
-                       f"(checksum {h4(after)}, stored {h4(stored)})")
+                       f"(checksum {h4(after)}, {label} {h4(stored)})")
         tmp_patch = None
         if fmt:
             make, apply = fmt
@@ -575,7 +670,7 @@ def run(args, rep):
             os.unlink(tmp)
 
     rep.set(checksum_after=h4(after))
-    rep.info(f"checksum after   = {h4(after)}, stored = {h4(stored)} -> OK")
+    rep.info(f"checksum after   = {h4(after)}, {label} = {h4(stored)} -> OK")
     return True
 
 
