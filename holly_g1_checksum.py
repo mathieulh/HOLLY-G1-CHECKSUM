@@ -37,12 +37,14 @@ Safety:
   - the output must differ from the input; it is written to a temporary file,
     verified, then renamed (a crash never leaves a half-written output).
 
-NAOMI BIOS (--reference REF):
-  NAOMI BIOSes do NOT store the expected value in their last 2 bytes. The checksum runs
-  over all 'size' bytes (0x200000), and every official BIOS of the same version ends in the
-  same final state; Sega tunes the last 6 bytes of each region variant to keep it. With
-  --reference, the script makes the modified BIOS reach the same final state (checksum
-  and fold) as REF, an unmodified BIOS of the same version, by patching its last 6 bytes.
+NAOMI / NAOMI 2 BIOS (--reference REF) - EXPERIMENTAL:
+  NAOMI BIOSes do NOT store the expected value in their last 2 bytes. Sega adjusts the last
+  6 bytes of each region variant, so those bytes feed the check, but the official BIOSes end
+  on many different final values (16 distinct values over 33 NAOMI / NAOMI 2 files), and
+  region variants of one build do not always share a value. The exact NAOMI rule is unknown.
+  --reference assumes that acceptance depends only on the final state over 'size' bytes,
+  and makes the modified BIOS end on a final state (checksum and fold) already used by an
+  official BIOS that boots, by patching its last 6 bytes.
   Matching the fold as well needs 6 bytes: 4 bytes only reach 87,381 of the 131,072
   possible states, 6 bytes reach 131,071, which is also what Sega reserves.
   REF can be a directory of unmodified BIOSes: the one closest to the input (fewest
@@ -508,8 +510,8 @@ def parse_args():
     p.add_argument("--patch-file", metavar="PATH",
                    help="also write an IPS (.ips) or BPS (.bps) patch from input to output")
     p.add_argument("--reference", metavar="REF",
-                   help="NAOMI mode: checksum ALL 'size' bytes (no stored value) and match the "
-                        "final checksum state of REF, an unmodified BIOS of the same version. "
+                   help="EXPERIMENTAL NAOMI mode: checksum ALL 'size' bytes (no stored value) "
+                        "and match the final checksum state of REF, an unmodified official BIOS. "
                         "REF can be a file, or a DIRECTORY of unmodified BIOSes: the closest "
                         "one (fewest differing bytes) is then picked automatically")
     p.add_argument("--init", type=integer, default=0, help="initial state A (default 0)")
@@ -541,6 +543,8 @@ def run(args, rep):
     if naomi:
         ref_path, ref_A, ref_fold = find_reference(args.reference, image[base:base + size],
                                                    base, size, args.init, rep)
+        rep.warn("NAOMI mode is experimental: the NAOMI check is not fully understood and "
+                 "this result has not been validated on hardware")
     if free_start < 0:
         raise Fail("free area larger than the checked area")
 
