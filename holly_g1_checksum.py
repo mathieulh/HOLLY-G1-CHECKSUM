@@ -54,7 +54,10 @@ NAOMI / NAOMI 2 BIOS (--reference REF) - EXPERIMENTAL:
   and makes the modified BIOS end on a final state (checksum and fold) already used by an
   official BIOS that boots, by patching its last 6 bytes.
   Matching the fold as well needs 6 bytes: 4 bytes only reach 87,381 of the 131,072
-  possible states, 6 bytes reach 131,071, which is also what Sega reserves.
+  possible states, 6 bytes reach 131,071, which is also what Sega reserves. The one state
+  6 bytes cannot reach (start - 1, same fold: it needs two overflows) needs 7, so the
+  script falls back to 7 or 8 bytes in that case only. On retail NAOMI those extra bytes
+  are in the fixed tail block, so --force is then required.
   REF can be a directory of unmodified BIOSes: the one closest to the input (fewest
   differing bytes) is picked automatically.
   Whether HOLLY accepts the result has not been tested on hardware.
@@ -89,9 +92,10 @@ MAX_BIOS_SIZE = 0x200000   # largest expected BIOS size; above it --force is req
 FOLD = 0x1104              # fold pattern = spread(0x52)
 PREVIEW = 16               # max bytes shown for user writes
 PADDING = (0x00, 0xFF)
-MAX_LENGTH = 6             # max patch length (search cost grows quickly)
+MAX_LENGTH = 8             # max patch length. 6 bytes reach every checksum state but one
+                           # (start - 1 with the same fold, which needs two overflows); 7 reach all
 SEGA_TUNE = 6              # NAOMI: last bytes Sega tunes to keep the checksum per version
-NAOMI_LENGTH = 6           # NAOMI: default patch length (checksum + fold, all states)
+NAOMI_LENGTH = 6           # NAOMI: preferred patch length (Sega's 6 bytes); 7-8 only as fallback
 
 
 class Fail(Exception):
@@ -155,9 +159,9 @@ def byte_cost(old_byte, pad):
 
 def _dedup_min(keys, cost):
     """Indices keeping, for each distinct key, the candidate with the lowest cost."""
-    comp = keys * 64 + cost                     # cost < 64 (<= (MAX_LENGTH + 2) * MAX_LENGTH = 48)
+    comp = keys * 128 + cost                    # cost < 128 (<= (MAX_LENGTH + 2) * MAX_LENGTH = 80)
     comp_u, idx = np.unique(comp, return_index=True)
-    k = comp_u >> 6
+    k = comp_u >> 7
     first = np.ones(len(k), dtype=bool)
     first[1:] = k[1:] != k[:-1]
     return idx[first]
@@ -677,8 +681,9 @@ def parse_args():
     p.add_argument("--offset", type=integer,
                    help="patch offset inside the free area (default: end of free area)")
     p.add_argument("--length", type=int,
-                   help=f"patch length in bytes, 1..{MAX_LENGTH} "
-                        "(default 3 at end of area, 4 with --offset, 6 with --reference)")
+                   help=f"patch length in bytes, 1..{MAX_LENGTH} (default 3 at end of area, "
+                        "4 with --offset; with --reference up to 6, or 7-8 when 6 cannot "
+                        "reach the target)")
     p.add_argument("--write", type=pair, action="append", default=[], metavar="OFF=HEX",
                    help="write hex bytes at any offset (repeatable)")
     p.add_argument("--file", type=pair, action="append", default=[], metavar="OFF=PATH",
@@ -803,7 +808,7 @@ def run(args, rep):
     if args.length:
         length = args.length
     elif naomi:
-        length = NAOMI_LENGTH          # checksum AND fold: 6 bytes reach every state
+        length = min(MAX_LENGTH, args.free_area)   # 6 preferred, 7-8 as fallback (see below)
     else:
         length = 3 if at_end else 4
     if not 1 <= length <= MAX_LENGTH:
@@ -833,8 +838,11 @@ def run(args, rep):
         # Try every length from 1 to 6, all ending at the last byte. Keep the one that
         # changes the fewest bytes; on a tie, the shortest (closest to the end), which
         # leaves the earlier bytes alone and matches how Sega adjusts its own variants.
+        # Only if no 1-6 byte patch exists (target = start - 1, same fold) try 7, then 8.
         patch, best = None, None
         for k in range(1, length + 1):
+            if k > NAOMI_LENGTH and patch is not None:
+                break
             Ak, fk = state(image[base + offset:base + zone - k], A, fold)
             p_k = solve_at_end(Ak, fk, old[length - k:], pad, target, target_fold)
             if p_k is None:
@@ -848,8 +856,9 @@ def run(args, rep):
     else:
         patch = solve_at_end(A, fold, old, pad, target, target_fold)
     if patch is None:
-        raise Fail(f"no patch found at {h(offset)}. Omit --offset to place the patch "
-                   "at the end of the free area.")
+        raise Fail(f"no patch of up to {length} bytes found at {h(offset)}. Omit --offset "
+                   "to place the patch at the end of the free area, or raise --length "
+                   f"(up to {MAX_LENGTH}).")
     changed = sum(a != b for a, b in zip(old, patch))
 
     # 5. Overwrite protection: changed bytes must be padding unless --force
