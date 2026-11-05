@@ -316,14 +316,41 @@ how well they agree:
 
 ```sh
 python3 validate_g1_tests.py g1test.bin tests_physiques_G1.txt --size 0x400
+python3 validate_g1_tests.py g1test.bin hardware_tests_G1.txt --size 0x400
 ```
 
 - The first argument is the base BIOS, as a `.bin` file or as a C array export (`.c`).
-- The test log has one test per line, in the format
-  `ADR=Llane OLD->NEW [; ADR=Llane OLD->NEW ...] || G1=OUVERT/FERME`
-  (`OUVERT` = open, `FERME` = closed).
+- The second is the test log, in **French or English**. The language is detected on each line,
+  so a log can mix both. One test per line:
+
+  | Language | Format |
+  |---|---|
+  | French | `ADR=Llane OLD->NEW [; ADR=Llane OLD->NEW ...] \|\| G1=OUVERT` or `G1=FERME` |
+  | English | `ADR=Llane OLD->NEW [; ADR=Llane OLD->NEW ...] \|\| G1=OPEN` or `G1=CLOSED` |
+
+  Results are read without regard to case or accents (`FERMÉ` = `FERME`), and `OUVERTE`,
+  `FERMEE`, `OPENED` and `CLOSE` are also accepted. Lines starting with `#` and blank lines are
+  ignored. Results marked `ERR`, `ERREUR` or `ERROR` are skipped and counted. Any other result
+  stops the script with the line number.
 - For each test, the changes are applied to the base BIOS and the script predicts whether
-  G1 opens. The result is a confusion matrix, followed by the mismatches.
+  G1 opens. The result is a confusion matrix, followed by the mismatches:
+
+```
+base image     : 0x200000 bytes, size checked 0x400
+tests          : 68245 (original byte mismatches: 0)
+log language   : French (OUVERT/FERME) 68245
+base checksum  : 0x0000, stored 0x0000 -> OK
+
+                    hardware OPEN   hardware CLOSED
+predicted OPEN              10169               208
+predicted CLOSED                0             57868
+agreement          : 99.695 %
+```
+
+- `original byte mismatches` counts the changes whose `OLD` byte doesn't match the base BIOS.
+  It should be `0`; anything else means the log was recorded on a different BIOS.
+- Options: `--size` (checked size, default `0x400`) and `--show N` (number of mismatches to
+  list, default 20).
 
 The test logs contain Develop BIOS bytes and are **not** included in this repository.
 `validate_g1_tests.py` contains no BIOS data.
