@@ -119,7 +119,7 @@ Numbers can be written in decimal or hex (`1024`, `0x400`).
 | `--base OFF` | `0x0` | Where the BIOS image starts inside the file. |
 | `--free-area N` | `8` | Size of the free area, in bytes, just before the last 2 bytes of the image. |
 | `--offset OFF` | end of free area | Place the patch at a specific offset inside the free area. |
-| `--length N` | `3` (at end), `4` (with `--offset`), `6` (with `--reference`) | Patch length, 1 to 6 bytes. Fewer than 3 bytes can fail. |
+| `--length N` | `3` (at end), `4` (with `--offset`), up to `6` (with `--reference`, `7`–`8` only as a fallback) | Patch length, 1 to 8 bytes. Fewer than 3 bytes can fail. |
 | `--force` | | Allow the patch to overwrite non-padding bytes, and allow a `SIZE` above `0x200000`. A warning is still printed. |
 | `--patch-file PATH` | | Also write an IPS (`.ips`) or BPS (`.bps`) patch from input to output. |
 | `--init VALUE` | `0x0000` | Initial value of the checksum accumulator. |
@@ -230,7 +230,9 @@ Every change is shown as **old bytes → new bytes**. Long writes are shortened 
 | Check | Behaviour | Bypass |
 |---|---|---|
 | `SIZE` above `0x200000` (also with `--verify`) | Refused, probably a typo | `--force` (warning printed) |
-| Patch would change bytes other than `0x00` / `0xFF` | Refused, offsets listed | `--force` (warning printed) |
+| Patch would change bytes other than `0x00` / `0xFF` (NAOMI: except the last 6 bytes) | Refused, offsets listed | `--force` (warning printed) |
+| NAOMI: 7–8 byte fallback patch reaches into the fixed tail block | Refused, offsets listed | `--force` (warning printed) |
+| `--length` outside 1–8 | Refused | none |
 | A `--write` / `--file` overlaps the patch | Refused | none |
 | Output or patch file is the same file as the input | Refused | none |
 | Patch outside the free area | Refused | none |
@@ -376,11 +378,18 @@ python3 holly_g1_checksum.py modified.bin out.bin auto --reference epr-21576a.ic
 |---|---|---|
 | Checked area | first `SIZE - 2` bytes | all `SIZE` bytes |
 | Target | stored value (last 2 bytes) | final checksum **and** fold of the reference |
-| Default patch | 3 bytes, `SIZE - 5` to `SIZE - 3` | up to 6 bytes, `SIZE - 6` to `SIZE - 1` |
+| Default patch | 3 bytes, `SIZE - 5` to `SIZE - 3` | up to 6 bytes, `SIZE - 6` to `SIZE - 1` (7–8 bytes as a fallback) |
 
 - **6 bytes, not 4:** matching the fold as well as the checksum needs 6 bytes. 4 bytes reach only
   87,381 of the 131,072 possible states; 6 bytes reach 131,071. Sega also uses exactly 6.
   The script tries 1 to 6 bytes and keeps the patch that changes the fewest.
+- **7–8 bytes as a fallback:** the one state 6 bytes can't reach is **the starting value minus 1,
+  with the same fold**. Getting there means wrapping past `0xFFFF` twice, which needs a total of
+  `0x1FFFF`, and 6 bytes add at most `0x1FFFE`. 7 bytes reach every state. So, only when no 1–6
+  byte patch exists, the script tries 7 and then 8 bytes. This can happen when a change adds
+  exactly 1 to the checksum (for example a `00` → `01` in a zero area). On retail NAOMI the extra
+  bytes fall in the fixed tail block, so `--force` is required; on BIOSes ending in zeros, such
+  as `21336a`, it isn't.
 - **Reproduces Sega's own files:** `21576a` + region `03` gives `21579` byte for byte; `21576b`
   and `21576d` + region `02` give `21578a` and `21578d`.
 - **Choosing the reference:** a file is used as is; for a folder, the script picks the file with
@@ -405,7 +414,8 @@ Constants at the top of the script:
 DEFAULT_FREE_AREA = 8         # bytes (64 bits) just before the last 2 bytes
 MAX_BIOS_SIZE     = 0x200000  # largest expected BIOS size; above it --force is required
 SEGA_TUNE         = 6         # NAOMI: last bytes Sega adjusts, may be overwritten without --force
-NAOMI_LENGTH      = 6         # NAOMI: default patch length with --reference
+MAX_LENGTH        = 8         # longest patch the script will build (--length 1..8)
+NAOMI_LENGTH      = 6         # NAOMI: preferred patch length with --reference; 7-8 only as fallback
 FAR_REFERENCE     = 0x1000    # NAOMI: warn if the closest reference differs by more bytes
 ```
 
@@ -571,6 +581,8 @@ changes can then go anywhere.
 | 2 bytes | `0x0000` reachable from about 7% of starting states (random sample of 200 states) |
 | **3 bytes** | **`0x0000` reachable from all 131,072 / 131,072 states (exhaustive check)** |
 | **3 bytes** | **all 65,536 values reachable** from each of 150 sampled starting states |
+| 6 bytes, checksum **and** fold (NAOMI) | 131,071 / 131,072 states: all except starting value − 1 with the same fold |
+| 7 bytes, checksum **and** fold (NAOMI) | **all 131,072 states** |
 
 Each byte adds one of only 256 values between `0` and `0x5555`, so 2 bytes give too few
 combinations to hit an exact 16-bit value from most states. With 3 bytes, every one of the
@@ -614,10 +626,11 @@ Several patches usually reach the target. Each candidate gets a cost, and the ch
 
 | Per patch byte | Cost |
 |---|---|
-| Different from the original byte | +7 |
+| Different from the original byte | +9 |
 | Different from the padding byte | +1 |
 
-The changed-byte weight (7) is larger than the highest possible padding cost (6 bytes), so the
+The changed-byte weight (9, that is `MAX_LENGTH + 1`) is larger than the highest possible
+padding cost (8 bytes), so the
 order is strict: **fewest changed bytes first**, then the patch that looks most like the
 padding. The padding byte is whichever of `0x00` or `0xFF` is most common in the free area.
 
