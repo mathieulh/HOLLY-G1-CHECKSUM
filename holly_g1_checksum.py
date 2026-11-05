@@ -42,7 +42,9 @@ NAOMI BIOS (--reference REF):
   over all 'size' bytes (0x200000), and every official BIOS of the same version ends in the
   same final state; Sega tunes the last 6 bytes of each region variant to keep it. With
   --reference, the script makes the modified BIOS reach the same final state (checksum
-  and fold) as REF, an unmodified BIOS of the same version, by patching its last 4 bytes.
+  and fold) as REF, an unmodified BIOS of the same version, by patching its last 6 bytes.
+  Matching the fold as well needs 6 bytes: 4 bytes only reach 87,381 of the 131,072
+  possible states, 6 bytes reach 131,071, which is also what Sega reserves.
   REF can be a directory of unmodified BIOSes: the one closest to the input (fewest
   differing bytes) is picked automatically.
   Whether HOLLY accepts the result has not been tested on hardware.
@@ -59,6 +61,7 @@ Examples:
   holly_g1_checksum.py dump.bin out.bin 0x400 --base 0x10000 --json
   holly_g1_checksum.py bios.bin 0x400 --verify
   holly_g1_checksum.py naomi.bin 0x200000 --verify --reference naomi_bioses/
+  holly_g1_checksum.py modified.bin out.bin 0x200000 --reference naomi_bioses/
 """
 import argparse
 import json
@@ -76,6 +79,7 @@ PREVIEW = 16               # max bytes shown for user writes
 PADDING = (0x00, 0xFF)
 MAX_LENGTH = 6             # max patch length (search cost grows quickly)
 SEGA_TUNE = 6              # NAOMI: last bytes Sega tunes to keep the checksum per version
+NAOMI_LENGTH = 6           # NAOMI: default patch length (checksum + fold, all states)
 
 
 class Fail(Exception):
@@ -153,17 +157,34 @@ def _start(A, fold):
             np.zeros((1, 0), dtype=np.uint8))
 
 
+EXTEND_CHUNK = 8192         # parent states processed at once (8192 x 256 candidates)
+NO_COST = np.iinfo(np.int64).max
+
+
 def _extend(keys, cost, patches, bcost):
-    """Append one free byte to every state; keep the cheapest path to each new state."""
-    a = keys & 0xFFFF
-    fl = keys >> 16
-    n = a[:, None] + (SP[None, :] ^ np.where(fl, FOLD, 0)[:, None])
-    nk = ((n & 0xFFFF) | ((fl[:, None] ^ (n >= 0x10000)) << 16)).ravel()
-    nc = (cost[:, None] + bcost[None, :]).ravel()
-    sel = _dedup_min(nk, nc)
-    parent = sel // 256
-    val = (sel % 256).astype(np.uint8)
-    return nk[sel], nc[sel], np.hstack([patches[parent], val[:, None]])
+    """Append one free byte to every state; keep the cheapest path to each new state.
+    Works in chunks over a dense table of the 131072 possible states, so memory stays
+    bounded even when every state is reachable (5th and 6th byte of a 6-byte patch)."""
+    best_cost = np.full(1 << 17, NO_COST, dtype=np.int64)
+    best_parent = np.zeros(1 << 17, dtype=np.int64)
+    best_val = np.zeros(1 << 17, dtype=np.uint8)
+    for s in range(0, len(keys), EXTEND_CHUNK):
+        k = keys[s:s + EXTEND_CHUNK]
+        a = k & 0xFFFF
+        fl = k >> 16
+        n = a[:, None] + (SP[None, :] ^ np.where(fl, FOLD, 0)[:, None])
+        nk = ((n & 0xFFFF) | ((fl[:, None] ^ (n >= 0x10000)) << 16)).ravel()
+        nc = (cost[s:s + EXTEND_CHUNK, None] + bcost[None, :]).ravel()
+        sel = _dedup_min(nk, nc)                # cheapest candidate per state in this chunk
+        tk, tc = nk[sel], nc[sel]
+        better = tc < best_cost[tk]
+        tk, tc, sel = tk[better], tc[better], sel[better]
+        best_cost[tk] = tc
+        best_parent[tk] = s + sel // 256
+        best_val[tk] = sel % 256
+    nkeys = np.nonzero(best_cost != NO_COST)[0]
+    return (nkeys, best_cost[nkeys],
+            np.hstack([patches[best_parent[nkeys]], best_val[nkeys, None]]))
 
 
 def solve_at_end(A, fold, old, pad, target, target_fold=None):
@@ -476,7 +497,7 @@ def parse_args():
                    help="patch offset inside the free area (default: end of free area)")
     p.add_argument("--length", type=int,
                    help=f"patch length in bytes, 1..{MAX_LENGTH} "
-                        "(default 3 at end of area, 4 otherwise)")
+                        "(default 3 at end of area, 4 with --offset, 6 with --reference)")
     p.add_argument("--write", type=pair, action="append", default=[], metavar="OFF=HEX",
                    help="write hex bytes at any offset (repeatable)")
     p.add_argument("--file", type=pair, action="append", default=[], metavar="OFF=PATH",
@@ -592,7 +613,12 @@ def run(args, rep):
 
     # 3. Patch position
     at_end = args.offset is None
-    length = args.length or (4 if naomi or not at_end else 3)
+    if args.length:
+        length = args.length
+    elif naomi:
+        length = NAOMI_LENGTH          # checksum AND fold: 6 bytes reach every state
+    else:
+        length = 3 if at_end else 4
     if not 1 <= length <= MAX_LENGTH:
         raise Fail(f"--length must be between 1 and {MAX_LENGTH}")
     offset = zone - length if at_end else args.offset
@@ -616,6 +642,22 @@ def run(args, rep):
     rest = bytes(image[base + offset + length:base + zone])
     if rest:
         patch = solve_in_middle(A, fold, old, pad, rest, target, target_fold)
+    elif naomi and not args.length:
+        # Try every length from 1 to 6, all ending at the last byte. Keep the one that
+        # changes the fewest bytes; on a tie, the shortest (closest to the end), which
+        # leaves the earlier bytes alone and matches how Sega adjusts its own variants.
+        patch, best = None, None
+        for k in range(1, length + 1):
+            Ak, fk = state(image[base + offset:base + zone - k], A, fold)
+            p_k = solve_at_end(Ak, fk, old[length - k:], pad, target, target_fold)
+            if p_k is None:
+                continue
+            cand = old[:length - k] + p_k
+            n = sum(x != y for x, y in zip(old, cand))
+            if best is None or n < best:
+                patch, best = cand, n
+            if best <= 1:                       # 0 or 1 changed byte cannot be beaten
+                break
     else:
         patch = solve_at_end(A, fold, old, pad, target, target_fold)
     if patch is None:
