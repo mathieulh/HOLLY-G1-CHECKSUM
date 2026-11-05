@@ -1,24 +1,30 @@
 # HOLLY G1 Checksum
 
-Patch a Dreamcast BIOS image so it passes HOLLY's **G1 checksum check**. You can change bytes
-anywhere in the image; the script then corrects the checksum by writing **3 bytes** at the end
-of a small free area just before the last 2 bytes of the image.
+Patch a Dreamcast or NAOMI BIOS image so it passes HOLLY's **G1 checksum check**. You can
+change bytes anywhere in the image; the script then corrects the checksum by writing a few
+bytes at the end of the image.
 
-At boot, HOLLY computes a checksum over the BIOS and compares it with the **stored value** in
-the last 2 bytes of the image. If they don't match, the G1 bus (GD-ROM on Dreamcast,
-cartridge/DIMM on NAOMI) stays locked. The bus is only unlocked once the check passes.
+At boot, HOLLY computes a checksum over the BIOS. If it doesn't have the expected value, the
+G1 bus (GD-ROM on Dreamcast, cartridge/DIMM on NAOMI) stays locked. The bus is only unlocked
+once the check passes. What the checksum is compared with depends on the BIOS:
+
+- **Dreamcast retail and Develop BIOSes:** the **stored value** in the last 2 bytes of the image.
+- **NAOMI BIOSes:** no stored value. The checksum of the whole image must reach the same final
+  value as an unmodified BIOS of the same version (`--reference`).
 
 - Works on an already modified BIOS, or applies your changes for you (`--write` / `--file`)
 - With the default settings, always reaches a stored value of `0x0000` (checked for every possible checksum state)
 - Can also set a new stored value (`--set-stored`)
+- NAOMI BIOSes: patches to the final value of an official BIOS, picked automatically from a
+  folder of unmodified dumps (`--reference`)
 - Changes as few bytes as possible
 - Refuses to overwrite real data or to write over the input file
 - Can also produce an **IPS** or **BPS** patch, so you can share changes without the BIOS
 - Checked against **68,245 tests on real hardware** (see [Validation on hardware](#validation-on-hardware))
 
-> **NAOMI:** the size and offset of the area HOLLY checks in the NAOMI BIOS are **not known**.
-> This tool cannot be used to patch NAOMI BIOSes until those values are known.
-> See [BIOS sizes](#bios-sizes).
+> **NAOMI:** NAOMI support is based on analysis of the official BIOS files and has **not been
+> tested on hardware yet**. It needs at least one unmodified BIOS of the same version as the one
+> you modify. See [NAOMI BIOSes](#naomi-bioses).
 
 ---
 
@@ -47,6 +53,10 @@ python3 holly_g1_checksum.py bios.bin out.bin 0x200000 --write 0x1000=DEADBEEF -
 
 # Same, and also produce a BPS patch to share
 python3 holly_g1_checksum.py bios.bin out.bin 0x200000 --write 0x1000=DEADBEEF --patch-file out.bps
+
+# NAOMI: verify, then patch, picking the reference from a folder of unmodified BIOSes
+python3 holly_g1_checksum.py naomi.bin 0x200000 --verify --reference naomi_bioses/
+python3 holly_g1_checksum.py modified.bin out.bin 0x200000 --reference naomi_bioses/
 ```
 
 The input file is never modified.
@@ -55,15 +65,14 @@ The input file is never modified.
 
 `SIZE` must be the size of the area HOLLY checks, not just the file size.
 
-| BIOS | `SIZE` | Status |
-|---|---|---|
-| Retail Dreamcast BIOS | `0x200000` | Supported |
-| NAOMI / Dreamcast **Develop** BIOS | `0x400` | Supported, validated on hardware |
-| NAOMI BIOS | unknown | **Not supported**: the size and offset of the checked area are not known |
+| BIOS | `SIZE` | Compared with | Status |
+|---|---|---|---|
+| Retail Dreamcast BIOS | `0x200000` | Stored value (last 2 bytes) | Supported |
+| NAOMI / Dreamcast **Develop** BIOS | `0x400` | Stored value (last 2 bytes) | Supported, validated on hardware |
+| NAOMI BIOS | `0x200000` | Final value of a reference BIOS (`--reference`) | Supported, **not tested on hardware** |
 
-For the NAOMI BIOS, guessing values will produce a file whose checksum is "correct" for the
-wrong area, and HOLLY will not accept it. If the values become known, use `SIZE` and `--base`
-to point the script at the right area.
+A NAOMI BIOS checked without `--reference` always fails, even when unmodified: the script then
+looks for a stored value that NAOMI BIOSes don't have.
 
 ### Syntax
 
@@ -83,14 +92,15 @@ Numbers can be written in decimal or hex (`1024`, `0x400`).
 
 | Option | Default | Description |
 |---|---|---|
-| `--verify` | | Only check the input: checksum must equal the stored value. Writes nothing. |
+| `--verify` | | Only check the input: checksum must equal the stored value (or the reference's final value with `--reference`). Writes nothing. |
 | `--write OFF=HEX` | | Write hex bytes at offset `OFF`. Repeatable. Spaces are allowed if the argument is quoted. |
 | `--file OFF=PATH` | | Write the contents of a file at offset `OFF`. Repeatable. |
-| `--set-stored VALUE` | | Write a new stored value (16-bit, little-endian) to the last 2 bytes, and patch the checksum to match it. |
+| `--set-stored VALUE` | | Write a new stored value (16-bit, little-endian) to the last 2 bytes, and patch the checksum to match it. Not available with `--reference`. |
+| `--reference REF` | | NAOMI mode. `REF` is an unmodified BIOS of the same version, or a folder of unmodified BIOSes (the closest one is picked). See [NAOMI BIOSes](#naomi-bioses). |
 | `--base OFF` | `0x0` | Where the BIOS image starts inside the file. |
-| `--free-area N` | `8` | Size of the free area, in bytes, just before the last 2 bytes of the image. |
+| `--free-area N` | `8` | Size of the free area, in bytes, at the end of the checked area. |
 | `--offset OFF` | end of free area | Place the patch at a specific offset inside the free area. |
-| `--length N` | `3` (at end), `4` (with `--offset`) | Patch length, 1 to 6 bytes. Fewer than 3 bytes can fail. |
+| `--length N` | `3` (at end), `4` (with `--offset` or `--reference`) | Patch length, 1 to 6 bytes. Fewer than 3 bytes can fail. |
 | `--force` | | Allow the patch to overwrite non-padding bytes, and allow a `SIZE` above `0x200000`. A warning is still printed. |
 | `--patch-file PATH` | | Also write an IPS (`.ips`) or BPS (`.bps`) patch from input to output. |
 | `--init VALUE` | `0x0000` | Initial value of the checksum accumulator. |
@@ -165,7 +175,9 @@ Every change is shown as **old bytes → new bytes**. Long writes are shortened 
 | Check | Behaviour | Bypass |
 |---|---|---|
 | `SIZE` above `0x200000` (also with `--verify`) | Refused, probably a typo | `--force` (warning printed) |
-| Patch would change bytes other than `0x00` / `0xFF` | Refused, offsets listed | `--force` (warning printed) |
+| Patch would change bytes other than `0x00` / `0xFF` (NAOMI: except the last 6 bytes) | Refused, offsets listed | `--force` (warning printed) |
+| NAOMI: closest reference in the folder differs by more than `0x1000` bytes | Warning only | — |
+| `--set-stored` with `--reference` | Refused | none |
 | A `--write` / `--file` overlaps the patch | Refused | none |
 | Output or patch file is the same file as the input | Refused | none |
 | Patch outside the free area | Refused | none |
@@ -199,7 +211,7 @@ change to the stored value.
 
 | Exit code | Meaning |
 |---|---|
-| `0` | OK: checksum matches the stored value |
+| `0` | OK: checksum matches the stored value (or the reference's final value) |
 | `1` | Failed or refused: checksum mismatch, safety check, I/O error |
 | `2` | Invalid command-line arguments |
 
@@ -234,6 +246,9 @@ Example result (values depend on the input):
 ```
 
 With `--verify`, the object contains `"mode": "verify"`, `"checksum"` and `"stored"`.
+With `--reference`, `"stored"` is replaced by `"reference"`, `"fold"`, `"reference_checksum"` and
+`"reference_fold"`; when `REF` is a folder, `"reference_distance"` and `"reference_group"` are
+added (see [NAOMI BIOSes](#naomi-bioses)).
 On error, it contains `"ok": false` and an `"error"` message.
 
 ### Validation on hardware
@@ -255,13 +270,107 @@ python3 validate_g1_tests.py g1test.bin tests_physiques_G1.txt --size 0x400
 The test logs contain Develop BIOS bytes and are **not** included in this repository.
 `validate_g1_tests.py` contains no BIOS data.
 
+### NAOMI BIOSes
+
+NAOMI BIOSes don't store the expected value in their last 2 bytes. HOLLY's checksum runs over
+all `0x200000` bytes, and every official BIOS of the same version ends on the **same final
+value** (checksum and fold). With `--reference`, the script patches a modified BIOS so it ends on
+the same final value as an unmodified one.
+
+```sh
+# Verify a NAOMI BIOS
+python3 holly_g1_checksum.py mybios.bin 0x200000 --verify --reference naomi_bioses/
+
+# Patch a modified NAOMI BIOS
+python3 holly_g1_checksum.py modified.bin out.bin 0x200000 --reference naomi_bioses/
+
+# Use one specific reference file instead of a folder
+python3 holly_g1_checksum.py modified.bin out.bin 0x200000 --reference epr-21576a.bin
+```
+
+In NAOMI mode:
+
+| | Dreamcast (default) | NAOMI (`--reference`) |
+|---|---|---|
+| Checked area | first `SIZE - 2` bytes | all `SIZE` bytes |
+| Target | stored value (last 2 bytes) | final checksum **and** fold of the reference |
+| Free area (default 8 bytes) | `SIZE - 10` to `SIZE - 3` | `SIZE - 8` to `SIZE - 1` |
+| Default patch | 3 bytes, `SIZE - 5` to `SIZE - 3` | 4 bytes, `SIZE - 4` to `SIZE - 1` |
+
+The last 6 bytes of a NAOMI BIOS are the bytes Sega adjusts to keep each version's final value
+(see [NAOMI: no stored value](#naomi-no-stored-value)). The patch may overwrite them without
+`--force`.
+
+#### Choosing the reference
+
+`REF` can be a file or a folder:
+
+- **A file** is used as is. The best choice is the exact unmodified dump you started from.
+- **A folder** of unmodified official BIOSes: the script compares your BIOS with every file of
+  at least `base + SIZE` bytes, and uses the one with the **fewest differing bytes**.
+
+```
+reference        = epr-21576a.bin (closest of 20, 0 byte(s) differ)
+same final state = epr-21576a.bin, epr-21579.bin, epr-21576b.bin, epr-21577a.bin, epr-21578a.bin
+free area        = 0x1FFFF8 .. 0x1FFFFF (inclusive)
+write @ 0x4BF68 : 00 -> 03
+checksum before  = 0x4A74, reference = 0x4A73
+patch @ 0x1FFFFC : EE CA 3F 38 -> EE CA 3E 38 (1 byte(s) changed)
+checksum after   = 0x4A73, reference = 0x4A73 -> OK
+```
+
+- `reference` is the file picked and how many bytes differ from it.
+- `same final state` lists every BIOS in the folder that ends on the same final value. Any of
+  them would give the same result.
+- If even the closest file differs by more than `0x1000` bytes, a warning says your BIOS is
+  probably a version that isn't in the folder.
+
+Rules for the folder:
+
+- **Only unmodified official dumps.** A patched file in the folder would be the closest match to
+  itself, and every check against it would pass.
+- **After large changes, check the `same final state` line** to make sure the right version was
+  picked.
+- **Run identification on an unmodified file** when you just want to know which BIOS you have.
+
+#### Final values of the official BIOSes
+
+Checksum over all `0x200000` bytes of each official BIOS. Any BIOS in a group can be used as the
+reference for the others in that group:
+
+| Final checksum (fold) | BIOSes |
+|---|---|
+| `0x4A73` (0) | 21576a, 21576b, 21577a, 21578a, 21579 |
+| `0x4653` (0) | 21576e, 21576g, 21577g, 21578e |
+| `0xF853` (`0x1104`) | 21576h, 21577h, 21578h |
+| `0x4A53` (0) | 21576d, 21578d |
+| `0x5B57` (0) | 21576, 21577d |
+| `0x14A2` (0) | 21576c |
+| `0x8E53` (`0x1104`) | 21577e |
+| `0x4843` (0) | 21578f |
+| `0x1253` (0) | 21578g |
+
+The file name is **not** a reliable guide. The number (21576 to 21579) is the region variant
+and the letter the revision, but `21577d` ends with `21576` rather than with `21576d`/`21578d`,
+and `21577e` doesn't end with `21576e`/`21578e`. Let the script pick from a folder, or use the
+exact file you started from.
+
+#### Limits
+
+- **Not tested on hardware.** The method reproduces what Sega did in its own BIOSes (see
+  [Part 2](#naomi-no-stored-value)), but no NAOMI BIOS patched this way has been booted yet.
+- **A clean BIOS of the same version is required.** How HOLLY knows the expected value on NAOMI
+  is still unknown, so the script can't target a version you don't have an unmodified copy of.
+
 ### Changing the defaults
 
-Two constants at the top of the script:
+Constants at the top of the script:
 
 ```python
-DEFAULT_FREE_AREA = 8         # bytes (64 bits) just before the last 2 bytes
+DEFAULT_FREE_AREA = 8         # bytes (64 bits) at the end of the checked area
 MAX_BIOS_SIZE     = 0x200000  # largest expected BIOS size; above it --force is required
+SEGA_TUNE         = 6         # NAOMI: last bytes Sega adjusts, may be overwritten without --force
+FAR_REFERENCE     = 0x1000    # NAOMI: warn if the closest reference differs by more bytes
 ```
 
 ---
@@ -309,6 +418,9 @@ def holly_check(image, size):
 
 Unmodified retail Dreamcast BIOSes give `0x0000` over `0x200000` bytes.
 
+NAOMI BIOSes use the same algorithm with a different target: see
+[NAOMI: no stored value](#naomi-no-stored-value).
+
 ### Validation on hardware
 
 The algorithm was checked against **68,245 unique tests** run on real hardware with a
@@ -338,6 +450,44 @@ following:
   would decode as an SH-4 instruction.
 - The result depends only on the 4 bytes at `0xFC`–`0xFF`: tests with the same values there
   never gave different results.
+
+### NAOMI: no stored value
+
+The same checksum, applied to NAOMI BIOSes with the Dreamcast rule (first `0x1FFFFE` bytes
+compared with the last 2), fails for every official file. Other places and encodings for a
+stored value were tried, and none matched. What the official files show instead:
+
+- **Same version, same final value.** Run over all `0x200000` bytes, the region variants of a
+  version all end on the same checksum **and** fold (table in
+  [Final values of the official BIOSes](#final-values-of-the-official-bioses)). Different
+  versions end on different values.
+- **Sega keeps that value on purpose.** The region variants differ by a region byte
+  (`00`/`01`/`02`/`03`). When changing it would alter the final value, Sega also changed some of
+  the last bytes of the file to bring it back. For example, `21576h` and `21578h` differ by the
+  region byte at `0x586E0` and 6 bytes at `0x1FFFFA`–`0x1FFFFF`.
+- **This confirms the algorithm.** Those adjustments only work out with exactly this checksum
+  (fold `0x1104`, toggled on overflow, over all `0x200000` bytes). With any other rule, the
+  region variants would not match each other.
+- **It isn't a different starting value.** All 131,072 possible starting states were tried; no
+  single one gives a common result for all files.
+
+So in NAOMI mode, the script targets the final state `(A, fold)` of a reference BIOS instead of
+a stored value. Matching the fold as well as `A` keeps the result identical to an official BIOS,
+whatever HOLLY actually compares.
+
+Checked against Sega's own files, by applying a region change to one BIOS and letting the script
+fix it:
+
+| Input + change | Result |
+|---|---|
+| `21576a` + region `03` | **Identical** to `21579`, byte for byte |
+| `21576b` + region `02` | **Identical** to `21578a` |
+| `21576d` + region `02` | **Identical** to `21578d` |
+| `21576h` + region `02` | Same final value as `21578h`. Sega changed 6 bytes; the script changes 1 |
+
+Several quite different builds share a final value (for example `21576a` and `21576b` differ by
+about 194,000 bytes but both end on `0x4A73`). HOLLY may therefore accept a small set of values
+rather than one per version. This is speculation; which values HOLLY accepts on NAOMI is unknown.
 
 ### The state space
 
@@ -405,7 +555,9 @@ but this is not proven for every state.
 
 ### Finding the patch
 
-The target `T` is the stored value, read after your changes are applied.
+The target `T` is the stored value, read after your changes are applied. With `--reference`,
+the target is the reference's final state: `A = T` **and** the fold after the last byte must
+match the reference's fold.
 
 **Patch at the end (default).** The first `length - 1` bytes are searched; the last one is
 computed directly.
@@ -453,6 +605,7 @@ reports `(unchanged)`.
 2. Write the result to a temporary file in the output directory and flush it to disk (`fsync`).
 3. Read the temporary file back and check its content, and that the checksum equals the
    stored value.
+   With `--reference`, it checks that the final state matches the reference instead.
 4. If requested, build the IPS/BPS patch, apply it to the input in memory and check it gives
    exactly the output.
 5. Rename the temporary file(s) to the final name in one step (`os.replace`).
@@ -487,9 +640,7 @@ Each test took about **7 seconds**, so 70,000 tests add up to roughly **136 hour
 to reduce the checksum to the algorithm in [Part 2](#part-2--how-it-works), and they are what
 the script is [validated against](#validation-on-hardware-1).
 
-
 <img width="3840" height="2891" alt="s2ohdlx04cxh1" src="https://github.com/user-attachments/assets/834f86ad-20c7-4aa4-b8d9-6b05ffeed8ec" />
-
 
 ## Contributors
 
