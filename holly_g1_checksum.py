@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HOLLY G1 checksum - patch a Dreamcast BIOS image so HOLLY accepts it.
+"""HOLLY G1 checksum - patch a Dreamcast / System SP BIOS image so HOLLY accepts it.
 
 HOLLY G1 check (validated against 68,245 tests on real hardware):
   - a checksum is computed over the first (size - 2) bytes of the BIOS image
@@ -13,8 +13,15 @@ Checked size ('auto'):
   (0x005F74E4). With SIZE = auto, the script finds that write in the boot code (including
   the hidden loader at 0xE0, stored with its halfwords or longwords reversed) and
   uses value + 1. It also follows loaders the boot code builds in RAM (Develop BIOS).
-  Found in all 50 BIOSes tested: Dreamcast / NAOMI / NAOMI 2 0x1FFFFF, Develop 0x3FF,
-  Atomiswave 0xA677 (bios0/bios1) and 0xA673 (fpr-24363, BIOS at 0x60000).
+  Found in all 53 BIOSes tested: Dreamcast / NAOMI / NAOMI 2 / System SP 0x1FFFFF,
+  Develop 0x3FF, Atomiswave 0xA677 (bios0/bios1) and 0xA673 (fpr-24363, BIOS at 0x60000).
+
+System SP:
+  The three System SP BIOSes tested (epr-24236a, epr-24328, epr-24328a) follow the
+  Dreamcast stored-value rule: checksum of 0x0-0x1FFFFD = 0x0000 = stored value. They use
+  the same hidden loader at 0xE0 as NAOMI, and Sega tunes 6 bytes at 0x1FFDFA-0x1FFDFF so
+  the checksum reaches (0x0000, fold 0) before the zero tail. Use the default mode
+  (size 0x200000 or auto). Patched System SP BIOSes have not been tested on hardware.
 
 BIOS image location inside the file:
   --base  start of the BIOS image in the file (default 0x0)
