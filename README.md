@@ -19,12 +19,13 @@ cartridge/DIMM on NAOMI, System SP and Atomiswave) stays locked.
 - Can also produce an **IPS** or **BPS** patch, so you can share changes without the BIOS
 - Checked against **68,245 tests on real hardware** (see [Validation on hardware](#validation-on-hardware))
 - Reads the checked size from the BIOS's own boot code (`SIZE` = `auto`)
+- Can lay out the patch bytes the way Sega does (`--style develop`, `--style naomi`)
 
 > [!WARNING]
 > **Only Dreamcast BIOSes (retail and Develop) are fully supported.**
 > - **System SP:** supported. Official BIOSes follow the Dreamcast rule, but no patched
 >   System SP BIOS has been booted yet.
-> - **NAOMI / NAOMI 2:** experimental (`--reference`). The checked size is known (`0x200000`),
+> - **NAOMI / NAOMI 2:** experimental (`--naomi`, `--naomi-target` or `--reference`). The checked size is known (`0x200000`),
 >   but official NAOMI BIOSes do **not** follow the stored-value rule, and the exact rule is
 >   unknown. Patched files have **not** been tested on hardware.
 > - **Atomiswave:** not supported. The checked size is known, but the rule is unknown;
@@ -63,6 +64,15 @@ python3 holly_g1_checksum.py bios.bin out.bin 0x200000 --write 0x1000=DEADBEEF -
 # Let the script read the checked size from the boot code
 python3 holly_g1_checksum.py bios.bin auto --verify
 
+# Same patch, laid out like the Develop BIOS (even split + 53 AD AD AD)
+python3 holly_g1_checksum.py bios.bin out.bin 0x400 --write 0x10=DEADBEEF --style develop
+
+# NAOMI (experimental): verify against the known official final values, no reference needed
+python3 holly_g1_checksum.py naomi.bin auto --verify --naomi
+
+# NAOMI (experimental): change an unmodified official BIOS and keep its final value
+python3 holly_g1_checksum.py epr-21576a.ic27 out.bin auto --naomi --write 0x4BF68=03
+
 # NAOMI (experimental): verify against a folder of unmodified official BIOSes
 python3 holly_g1_checksum.py naomi.bin auto --verify --reference naomi_bioses/
 ```
@@ -79,7 +89,7 @@ from the BIOS itself (see [Automatic size detection](#automatic-size-detection))
 | Retail Dreamcast BIOS (`mpr-*`, `dc_boot`, `set5*`) | `0x200000` | **Supported** |
 | NAOMI / Dreamcast **Develop** BIOS | `0x400` | **Supported**, validated on NAOMI hardware, also works on Dreamcast |
 | System SP BIOS (`epr-24236a`, `epr-24328`, `epr-24328a`) | `0x200000` | **Supported** (official BIOSes verify; patched files not yet tested on hardware) |
-| NAOMI / NAOMI 2 BIOS (`epr-215xx`, `epr-236xx`, `epr-21336a`) | `0x200000` | **Experimental**, with `--reference` only |
+| NAOMI / NAOMI 2 BIOS (`epr-215xx`, `epr-236xx`, `epr-21336a`) | `0x200000` | **Experimental**: `--naomi`, `--naomi-target` or `--reference` |
 | Atomiswave BIOS (`bios0`, `bios1`) | `0xA678` | **Not supported**: rule unknown |
 | Atomiswave `fpr-24363` (BIOS at `0x60000`) | `0xA674` (with `--base 0x60000`) | **Not supported**: rule unknown |
 
@@ -90,7 +100,7 @@ from the BIOS itself (see [Automatic size detection](#automatic-size-detection))
 | Dreamcast retail | Yes | **Yes**: checksum of the first `SIZE - 2` bytes = stored value | Verify and patch |
 | Dreamcast / NAOMI Develop | Yes | **Yes**, validated by 68,245 hardware tests | Verify and patch |
 | System SP | Yes | **Yes**: same as Dreamcast retail (all 3 official BIOSes match) | Verify and patch |
-| NAOMI / NAOMI 2 | Yes | **No** | `--reference` mode, experimental, warning printed |
+| NAOMI / NAOMI 2 | Yes | **No** | NAOMI mode (`--naomi`, `--naomi-target`, `--reference`), experimental, warning printed |
 | Atomiswave | Yes | **No** | `auto` finds the size; a warning says the rule doesn't hold |
 
 What "rule unknown" means: on official NAOMI, NAOMI 2 and Atomiswave BIOSes, the checksum
@@ -119,11 +129,14 @@ Numbers can be written in decimal or hex (`1024`, `0x400`).
 | `--verify` | | Only check the input: checksum must equal the stored value, and the fold must be `0` after the stored bytes. Writes nothing. |
 | `--write OFF=HEX` | | Write hex bytes at offset `OFF`. Repeatable. Spaces are allowed if the argument is quoted. |
 | `--file OFF=PATH` | | Write the contents of a file at offset `OFF`. Repeatable. |
-| `--set-stored VALUE` | | Write a new stored value (16-bit, little-endian) to the last 2 bytes, and patch the checksum to match it. Not available with `--reference`. |
+| `--set-stored VALUE` | | Write a new stored value (16-bit, little-endian) to the last 2 bytes, and patch the checksum to match it. Not available in NAOMI mode. |
+| `--style S` | `minimal` | How the patch bytes are laid out: `minimal` (fewest changed bytes), `develop` (the Develop BIOS scheme) or `naomi` (the official NAOMI scheme, NAOMI mode only). See [Patch styles](#patch-styles). |
+| `--naomi` | | **Experimental** NAOMI mode without a reference file. Patching keeps the input's own final value; `--verify` checks it against the known official values. See [NAOMI and NAOMI 2 (experimental)](#naomi-and-naomi-2-experimental). |
+| `--naomi-target CHECKSUM[:FOLD]` | | **Experimental** NAOMI mode with an explicit final value, e.g. `0x4A73` or `0xF853:0x1104`. For inputs that are already modified. |
 | `--reference REF` | | **Experimental** NAOMI mode. `REF` is an unmodified official BIOS, or a folder of them (the closest one is picked). See [NAOMI and NAOMI 2 (experimental)](#naomi-and-naomi-2-experimental). |
 | `--base OFF` | `0x0` | Where the BIOS image starts inside the file. |
 | `--free-area N` | `8` | Size of the free area, in bytes, just before the last 2 bytes of the image. |
-| `--offset OFF` | end of free area | Place the patch at a specific offset inside the free area. |
+| `--offset OFF` | end of free area | Place the patch at a specific offset inside the free area. Not with `--style develop` / `naomi`. |
 | `--length N` | shortest that works, up to 8 (at end); `4` (with `--offset`); up to `6` (with `--reference`, `7`–`8` only as a fallback) | Patch length, 1 to 8 bytes. Fewer than 3 bytes can fail. |
 | `--any-fold` | | Only require checksum = stored value, and ignore the fold. Reproduces the behaviour of earlier versions; **not recommended** (see [The fold rule](#the-fold-rule)). |
 | `--force` | | Allow the patch to overwrite non-padding bytes, and allow a `SIZE` above `0x200000`. A warning is still printed. |
@@ -259,9 +272,16 @@ Every change is shown as **old bytes → new bytes**. Long writes are shortened 
 | `--set-stored` value for which no fold can end at `0` | Refused | choose another value, or `--any-fold` |
 | `SIZE` = `auto` and no (or conflicting) `SB_SECUR_EADR` write found | Refused | give `SIZE` |
 | `SIZE` = `auto` finds a size other than `0x400` / `0x200000` (Atomiswave) | Warning only | — |
-| `--reference` used (NAOMI) | Warning: experimental, not validated on hardware | — |
+| NAOMI mode used | Warning: experimental, not validated on hardware | — |
 | NAOMI: closest reference in the folder differs by more than `0x1000` bytes | Warning only | — |
-| `--set-stored` with `--reference` | Refused | none |
+| `--set-stored` in NAOMI mode | Refused | none |
+| `--style naomi` outside NAOMI mode, or `--style develop` in NAOMI mode | Refused | none |
+| `--style develop` / `naomi` with `--offset` or `--length` | Refused | drop them: the style sets position and length |
+| `--style develop` patch longer than the free area | Uses a plain even split instead; refused if even that doesn't fit | raise `--free-area` |
+| `--style naomi`: target is the checksum before the patch minus 1, same fold | Refused (no 6-byte patch exists) | use the default style (7 bytes) |
+| `--naomi` without `--write`/`--file`, on an input whose final value isn't official | Refused (the original value is lost) | `--naomi-target` or `--reference` |
+| NAOMI target that isn't a known official final value | Warning only | — |
+| `--reference` together with `--naomi-target` | Refused | none |
 
 > **Re-patching:** once a BIOS has been patched, its patch bytes are no longer padding. If you
 > change it again, the new patch will usually need `--force`. If the BIOS already passes, no
@@ -389,16 +409,59 @@ the **last 6 bytes** of each region variant, so those bytes feed the check. `--r
 assumes that acceptance depends only on the final checksum state over all `0x200000` bytes, and
 patches the last 6 bytes so a modified BIOS ends on the same state as an unmodified official one.
 
+There are three ways to give the target:
+
+| Option | Target | Use it for |
+|---|---|---|
+| `--naomi` | The input's own final value, read **before** your changes | Changes (`--write` / `--file`) to an **unmodified** official BIOS |
+| `--naomi-target CHECKSUM[:FOLD]` | The value you give | An input that is already modified |
+| `--reference REF` | The final value of a reference BIOS, or of the closest one in a folder | Either case, when you have the official dumps |
+
 ```sh
+# No reference file
+python3 holly_g1_checksum.py mybios.bin auto --verify --naomi
+python3 holly_g1_checksum.py epr-21576a.ic27 out.bin auto --naomi --write 0x4BF68=03
+python3 holly_g1_checksum.py modified.bin out.bin auto --naomi-target 0xF853:0x1104
+
+# With reference files
 python3 holly_g1_checksum.py mybios.bin auto --verify --reference naomi_bioses/
 python3 holly_g1_checksum.py modified.bin out.bin auto --reference naomi_bioses/
 python3 holly_g1_checksum.py modified.bin out.bin auto --reference epr-21576a.ic27
 ```
 
-| | Dreamcast (default) | NAOMI (`--reference`) |
+- **`--naomi` works the way Sega's region variants do:** each build keeps its final value when
+  its region byte changes. `epr-21576a.ic27 --naomi --write 0x4BF68=03` gives `epr-21579` byte
+  for byte.
+- **It can't fix an input that is already modified,** because its original final value is gone.
+  The script refuses if the input's value isn't one of the official ones, and asks for
+  `--naomi-target`.
+- **`--verify --naomi`** checks the final value against the 17 known official NAOMI / NAOMI 2
+  values and names the BIOSes that use it. All 20 NAOMI 1 dumps tested pass:
+
+```
+checksum         = 0x1043 (fold 0x0000) -> OK: official final state of epr-21579d, 23608
+```
+
+Known official final values (checksum / fold over all `0x200000` bytes):
+
+| Value | Fold | Official BIOSes |
+|---|---|---|
+| `0x4A73` | 0 | `epr-21576a/b`, `21577a`, `21578a`, `21579` |
+| `0x4653` | 0 | `epr-21576e/g`, `21577g`, `21578e` |
+| `0xF853` | `0x1104` | `epr-21576h`, `21577h`, `21578h` |
+| `0x4A53` | 0 | `epr-21576d`, `21578d` |
+| `0x5B57` | 0 | `epr-21576`, `21577d` |
+| `0x1043` | 0 | `epr-21579d`, `23608` |
+| `0x4853` | 0 | `epr-23605b`, `23607b`, `23608b`, `23609b` |
+| `0x483B` | 0 | `epr-23605a`, `23608a` |
+| `0x485B` | 0 | `epr-23605c`, `23608c` |
+| `0x484B` | 0 | `epr-23607c`, `23610b` |
+| `0x14A2`, `0x8E53`, `0x4843`, `0x1253`, `0x2349`, `0x1233`, `0x5F47` | 0 (`0x8E53`: `0x1104`) | `epr-21576c`, `21577e`, `21578f`, `21578g`, `21336a`, `23605`, `23607` |
+
+| | Dreamcast (default) | NAOMI mode |
 |---|---|---|
 | Checked area | first `SIZE - 2` bytes | all `SIZE` bytes |
-| Target | stored value (last 2 bytes) | final checksum **and** fold of the reference |
+| Target | stored value (last 2 bytes) | final checksum **and** fold (input's own, given, or reference's) |
 | Default patch | 3 bytes, `SIZE - 5` to `SIZE - 3` | up to 6 bytes, `SIZE - 6` to `SIZE - 1` (7–8 bytes as a fallback) |
 
 - **6 bytes, not 4:** matching the fold as well as the checksum needs 6 bytes. 4 bytes reach only
@@ -420,6 +483,68 @@ python3 holly_g1_checksum.py modified.bin out.bin auto --reference epr-21576a.ic
   values, and region variants of one build don't always share a value (see
   [NAOMI and Atomiswave: open questions](#naomi-and-atomiswave-open-questions)). So reaching a
   reference's final value may not be what HOLLY actually requires.
+
+### Patch styles
+
+`--style` controls how the patch bytes are laid out. Every style reaches the same target; only
+the bytes differ. HOLLY only sees the final checksum and fold, so the style doesn't change
+whether G1 opens.
+
+| Style | Where | Bytes |
+|---|---|---|
+| `minimal` (default) | End of the free area | Fewest changed bytes, the rest left at the padding value |
+| `develop` | Ends just before the stored value | The Develop BIOS scheme (below) |
+| `naomi` | Last 6 bytes of the image (NAOMI mode only) | The official NAOMI scheme (below) |
+
+Both Sega schemes work on **effective bytes**: the value a byte adds is always
+`spread(e)`, where `e` is the byte itself while the fold is `0`, and the byte XOR `0x52` while
+the fold is `0x1104` (`spread(b) ^ 0x1104 = spread(b ^ 0x52)`).
+
+**`--style develop`** reproduces how the Develop BIOS ends (`CF CE CE 53 AD AD AD`):
+
+1. **Even split:** 3 bytes (4–5 if needed) whose added values are as equal as possible and sum
+   exactly to what's needed to reach the stored value with fold `0x1104`.
+2. **Fixed reset `53 AD AD AD`:** with fold `0x1104` it adds `1 + 3 × 0x5555 = 0x10000`, so it
+   wraps once more and leaves the stored value with fold `0`.
+
+With the Develop BIOS's own bytes erased, `--style develop` writes `CF CE CE 53 AD AD AD` back
+byte for byte. When split + reset doesn't fit in the free area (usually when the checksum
+already has fold `0x1104` before the patch), or the stored value is above `0x5554` (the reset
+would wrap too early), a plain even split straight to fold `0` is used instead. Tested on 38,587
+random starting states with no failure.
+
+```sh
+python3 holly_g1_checksum.py bios.bin out.bin 0x400 --write 0x10=DEADBEEF --style develop
+```
+```
+style            = develop (3-byte even split + reset 53 AD AD AD)
+patch @ 0x3F7 : 00 00 00 00 00 00 00 -> D7 DA D3 53 AD AD AD (7 byte(s) changed)
+```
+
+**`--style naomi`** follows the construction found in the official NAOMI BIOSes' last 6 bytes:
+
+1. **Bit 7 provides the wrap:** each effective byte with bit 7 set adds `0x4000`. Four of them
+   add `0x10000`, one extra wrap, which is what most official BIOSes use (6 or 0 when the fold
+   needs it).
+2. **The rest is split evenly** over the low 7 bits of all six bytes.
+
+It does **not** reproduce Sega's exact bytes: the official files follow this construction, but
+how Sega picks each byte could not be derived. For example, `21576a` + region `03` gives
+`F2 F2 F2 FA 39 1B`; Sega's `21579` has `EF DF EE CA 3E 38`, and both end on `0x4A73` / fold `0`.
+One target can't be reached in 6 bytes (the checksum before the patch minus 1, same fold); the
+script then refuses and points to the default style, which can use 7.
+
+```sh
+python3 holly_g1_checksum.py epr-21576a.ic27 out.bin auto --naomi --write 0x4BF68=03 --style naomi
+```
+
+How the official BIOSes compare:
+
+| BIOS | Scheme |
+|---|---|
+| Develop | Exact even split to the stored value with fold `0x1104`, then `53 AD AD AD` |
+| Dreamcast retail, System SP | One even split over 6 bytes, with the number of wraps chosen so the fold ends at `0` |
+| NAOMI / NAOMI 2 | Bit 7 on the first bytes for the wrap, the rest split over 6 bytes; exact byte choice unknown |
 
 ### System SP
 
@@ -455,7 +580,7 @@ DEFAULT_FREE_AREA = 8         # bytes (64 bits) just before the last 2 bytes
 MAX_BIOS_SIZE     = 0x200000  # largest expected BIOS size; above it --force is required
 SEGA_TUNE         = 6         # NAOMI: last bytes Sega adjusts, may be overwritten without --force
 MAX_LENGTH        = 8         # longest patch the script will build (--length 1..8)
-NAOMI_LENGTH      = 6         # NAOMI: preferred patch length with --reference; 7-8 only as fallback
+NAOMI_LENGTH      = 6         # NAOMI: preferred patch length in NAOMI mode; 7-8 only as fallback
 FAR_REFERENCE     = 0x1000    # NAOMI: warn if the closest reference differs by more bytes
 ```
 

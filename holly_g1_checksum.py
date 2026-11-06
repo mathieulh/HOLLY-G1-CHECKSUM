@@ -73,6 +73,23 @@ NAOMI / NAOMI 2 BIOS (--reference REF) - EXPERIMENTAL:
   differing bytes) is picked automatically.
   Whether HOLLY accepts the result has not been tested on hardware.
 
+Patch styles (--style):
+  minimal  (default) fewest changed bytes, ending just before the stored value (or at the
+           end of the image in NAOMI mode).
+  develop  the Develop BIOS scheme: an even split (3 bytes, more if needed) that reaches the
+           stored value with fold 0x1104, then the fixed reset 53 AD AD AD, which adds exactly
+           0x10000 and leaves fold 0. Reproduces the Develop BIOS's own CF CE CE 53 AD AD AD.
+  naomi    the official NAOMI scheme, in the last 6 bytes: bit 7 on the first bytes provides
+           the extra wrap, the rest is split evenly over the low 7 bits. Same construction as
+           Sega's, but not Sega's exact bytes (the exact choice could not be derived).
+
+NAOMI without a reference file (--naomi, --naomi-target):
+  Patching keeps the INPUT's own final state when changes are given with --write/--file on
+  an unmodified official BIOS - the same way Sega's region variants keep their build's
+  value. For an input that is already modified, give the original value with
+  --naomi-target (e.g. 0x4A73, or 0xF853:0x1104). --verify --naomi checks the final state
+  against the 17 known official NAOMI / NAOMI 2 values. Experimental, like --reference.
+
 Optional patch file (--patch-file): IPS (.ips) or BPS (.bps) patch from the input
 to the output, so changes can be shared without distributing the BIOS.
 
@@ -87,6 +104,8 @@ Examples:
   holly_g1_checksum.py bios.bin auto --verify          (size read from SB_SECUR_EADR)
   holly_g1_checksum.py naomi.bin 0x200000 --verify --reference naomi_bioses/
   holly_g1_checksum.py modified.bin out.bin 0x200000 --reference naomi_bioses/
+  holly_g1_checksum.py epr-21576a.ic27 out.bin auto --naomi --write 0x4BF68=03 --style naomi
+  holly_g1_checksum.py bios.bin out.bin 0x400 --write 0x10=DEADBEEF --style develop
 """
 import argparse
 import struct
@@ -270,6 +289,149 @@ def solve_in_middle(A, fold, old, pad, rest, target, target_fold=None):
     if not len(i):
         return None
     return bytes(patches[rep[i[np.argmin(cost[i])]]])
+
+
+# --------------------------------------------------------------------------- Sega-style patches
+# Both styles work on EFFECTIVE bytes e: the value a byte adds is spread(e) whatever the fold,
+# because spread(raw) ^ 0x1104 == spread(raw ^ 0x52). The raw byte written is e ^ 0x52 while
+# the fold is 0x1104, e otherwise.
+
+DEVELOP_RESET = bytes([0x53, 0xAD, 0xAD, 0xAD])   # with fold 0x1104: adds 1 + 3 * 0x5555 = 0x10000
+OFFICIAL_NAOMI = {                                # final (checksum, fold) of official NAOMI BIOSes
+    (0x5B57, 0): "epr-21576, 21577d", (0x4A73, 0): "epr-21576a/b, 21577a, 21578a, 21579",
+    (0x14A2, 0): "epr-21576c", (0x4A53, 0): "epr-21576d, 21578d",
+    (0x4653, 0): "epr-21576e/g, 21577g, 21578e", (0xF853, FOLD): "epr-21576h, 21577h, 21578h",
+    (0x8E53, FOLD): "epr-21577e", (0x4843, 0): "epr-21578f", (0x1253, 0): "epr-21578g",
+    (0x1043, 0): "epr-21579d, 23608", (0x2349, 0): "epr-21336a (Develop)",
+    (0x1233, 0): "epr-23605", (0x483B, 0): "epr-23605a, 23608a",
+    (0x4853, 0): "epr-23605b, 23607b, 23608b, 23609b", (0x485B, 0): "epr-23605c, 23608c",
+    (0x5F47, 0): "epr-23607", (0x484B, 0): "epr-23607c, 23610b",
+}
+_SPREADS = sorted((SPREAD[e], e) for e in range(256))
+
+
+def _plan_total(A0, f0, target, target_fold, cap):
+    """Total amount to add (smallest) taking (A0, f0) to (target, target_fold), with the
+    right number of wraps for the fold. None if more than 'cap' would be needed."""
+    D = (target - A0) & 0xFFFF
+    for w in range(4):
+        total = D + 0x10000 * w
+        wraps = (A0 + total) >> 16
+        if total <= cap and (wraps & 1) == ((f0 != 0) != (target_fold != 0)):
+            return total
+    return None
+
+
+_REACH = {}
+
+
+def _reachable(allowed, k):
+    """Bitmask (Python int) of every total reachable as the sum of the spreads of k bytes
+    taken from 'allowed' (cached)."""
+    key = (allowed, k)
+    if key not in _REACH:
+        if k == 0:
+            _REACH[key] = 1
+        else:
+            prev, acc = _reachable(allowed, k - 1), 0
+            for v in {SPREAD[e] for e in allowed}:
+                acc |= prev << v
+            _REACH[key] = acc
+    return _REACH[key]
+
+
+def _even_split(total, n, allowed):
+    """n effective bytes (each from 'allowed') whose spreads add up to 'total' exactly, each
+    as close as possible to an equal share of what is left (share rounded up, larger value on
+    ties). Exact: a value is only taken if the remainder is still reachable. List or None."""
+    allowed = tuple(allowed)
+    vals = sorted((SPREAD[e], e) for e in allowed)
+    if not (_reachable(allowed, n) >> total) & 1:
+        return None
+    out, R = [], total
+    for left in range(n, 0, -1):
+        share = -(-R // left)
+        for v, e in sorted(vals, key=lambda t: (abs(t[0] - share), -t[0])):
+            rest = R - v
+            if rest >= 0 and (_reachable(allowed, left - 1) >> rest) & 1:
+                out.append(e)
+                R = rest
+                break
+    return out
+
+
+def _to_raw(A0, f0, effective):
+    """Raw bytes for a list of effective bytes, simulating the fold."""
+    A, f, out = A0, f0, bytearray()
+    for e in effective:
+        out.append(e ^ (0x52 if f else 0))
+        A += SPREAD[e]
+        if A >= 0x10000:
+            A &= 0xFFFF
+            f ^= FOLD
+    return bytes(out), (A, f)
+
+
+def develop_style(state_at, zone, target, fold_options, room=None):
+    """Develop BIOS scheme: an even split that reaches (target, fold 0x1104), followed by the
+    fixed reset 53 AD AD AD, which adds exactly 0x10000 and leaves (target, fold 0).
+    If that doesn't fit in 'room' bytes (or the reset can't be used: stored value above
+    0x5554, or only fold 0x1104 allowed), a plain even split to the required fold is used.
+    state_at(offset) gives the checksum state before 'offset'. Returns (offset, bytes, note)."""
+    reset_ok = 0 in fold_options and target <= 0x5554   # the reset must wrap on its last byte
+    plain_fold = 0 if 0 in fold_options else FOLD
+    plans = ([(True, n) for n in (3, 4, 5)] if reset_ok else []) + \
+            [(False, n) for n in (3, 4, 5)]
+    for use_reset, n in plans:
+        length = n + (len(DEVELOP_RESET) if use_reset else 0)
+        if room is not None and length > room:
+            continue
+        end_fold = FOLD if use_reset else plain_fold
+        A0, f0 = state_at(zone - length)
+        total = _plan_total(A0, f0, target, end_fold, n * 0x5555)
+        if total is None:
+            continue
+        eff = _even_split(total, n, range(256))
+        if eff is None:
+            continue
+        raw, st = _to_raw(A0, f0, eff)
+        if st != (target, end_fold):
+            continue
+        if use_reset:
+            return zone - length, raw + DEVELOP_RESET, f"{n}-byte even split + reset 53 AD AD AD"
+        why = ("the reset needs fold 0 allowed and a stored value up to 0x5554" if not reset_ok
+               else "split + reset would not fit in the free area")
+        return zone - length, raw, f"{n}-byte even split, no reset ({why})"
+    return None
+
+
+def naomi_style(A0, f0, target, target_fold):
+    """NAOMI scheme (6 bytes): bit 7 set on the first k effective bytes (k = 4 for one extra
+    wrap, as in most official BIOSes; 6 or 0 when needed), and the rest of the amount split
+    evenly over the low 7 bits of all six bytes. Returns raw bytes or None."""
+    total = _plan_total(A0, f0, target, target_fold, 6 * 0x5555)
+    if total is None:
+        return None
+    for k in (4, 6, 0, 2, 5, 3, 1):
+        r = total - 0x4000 * k
+        if 0 <= r <= 6 * 0x1555:
+            low = _even_split(r, 6, range(0x80))
+            if low is None:
+                continue
+            eff = [(0x80 if i < k else 0) | x for i, x in enumerate(low)]
+            raw, st = _to_raw(A0, f0, eff)
+            if st == (target, target_fold):
+                return raw
+    return None
+
+
+def parse_naomi_target(x):
+    """'0x4A73' or '0x4A73:0x1104' -> (checksum, fold)."""
+    a, _, f = x.partition(':')
+    fold = int(f, 0) if f else 0
+    if fold not in (0, FOLD):
+        raise argparse.ArgumentTypeError("fold must be 0 or 0x1104")
+    return int(a, 0) & 0xFFFF, fold
 
 
 # --------------------------------------------------------------------------- IPS / BPS
@@ -721,6 +883,18 @@ def parse_args():
                         "and match the final checksum state of REF, an unmodified official BIOS. "
                         "REF can be a file, or a DIRECTORY of unmodified BIOSes: the closest "
                         "one (fewest differing bytes) is then picked automatically")
+    p.add_argument("--naomi", action="store_true",
+                   help="EXPERIMENTAL NAOMI mode without a reference file: the whole image is "
+                        "checked. Patching keeps the input's own final state (use --write/--file "
+                        "on an UNMODIFIED official BIOS), or the one given with --naomi-target. "
+                        "--verify checks the final state against the known official values")
+    p.add_argument("--naomi-target", type=parse_naomi_target, metavar="CHECKSUM[:FOLD]",
+                   help="NAOMI mode: final state to reach, e.g. 0x4A73 or 0xF853:0x1104")
+    p.add_argument("--style", choices=["minimal", "develop", "naomi"], default="minimal",
+                   help="patch bytes: 'minimal' (default, fewest changed bytes), 'develop' (the "
+                        "Develop BIOS scheme: even split + reset 53 AD AD AD before the stored "
+                        "value), 'naomi' (the official NAOMI scheme in the last 6 bytes; NAOMI "
+                        "mode only)")
     p.add_argument("--any-fold", action="store_true",
                    help="stored-value mode: only require checksum == stored value. By default the "
                         "fold must also be 0 after the 2 stored bytes (fits every hardware test; "
@@ -748,16 +922,44 @@ def run(args, rep):
         if not args.force:
             raise Fail(msg + ". Check the size argument, or use --force to bypass the limit.")
         rep.warn(msg + " (--force)")
-    naomi = args.reference is not None
+    naomi = args.reference is not None or args.naomi or args.naomi_target is not None
     if naomi and args.set_stored is not None:
-        raise Fail("--set-stored cannot be used with --reference (no stored value)")
+        raise Fail("--set-stored cannot be used in NAOMI mode (no stored value)")
+    if args.style == "naomi" and not naomi:
+        raise Fail("--style naomi needs NAOMI mode (--naomi, --naomi-target or --reference)")
+    if args.style == "develop" and naomi:
+        raise Fail("--style develop is for stored-value BIOSes, not NAOMI mode")
+    if args.style != "minimal" and (args.offset is not None or args.length):
+        raise Fail("--style sets the patch position and length itself: drop --offset/--length")
+    if args.reference is not None and args.naomi_target is not None:
+        raise Fail("use either --reference or --naomi-target, not both")
     # checked area: [0, zone) relative to base. Retail/Develop: size - 2 (stored value
     # follows). NAOMI (--reference): the whole image, compared with the reference state.
     zone = size if naomi else size - 2
     free_start = zone - args.free_area
-    if naomi:
+    if naomi and args.reference is not None:
         ref_path, ref_A, ref_fold = find_reference(args.reference, image[base:base + size],
                                                    base, size, args.init, rep)
+    elif naomi:
+        ref_path = None
+        if args.naomi_target is not None:
+            ref_A, ref_fold = args.naomi_target
+            ref_path = "--naomi-target"
+        else:                                   # input's own final state (before any change)
+            ref_A, ref_fold = state(image[base:base + size], args.init)
+            ref_path = "input (before changes)"
+            if not args.verify and not (args.write or args.file):
+                if (ref_A, ref_fold) in OFFICIAL_NAOMI:
+                    rep.warn("no --write/--file given and the input already ends on an official "
+                             "final state: nothing to fix")
+                else:
+                    raise Fail("--naomi without --write/--file keeps the input's own final state, "
+                               f"{h4(ref_A)}/{h4(ref_fold)}, which is not an official value: the "
+                               "input looks modified already. Give the original target with "
+                               "--naomi-target (or --reference ORIGINAL)")
+        if (ref_A, ref_fold) not in OFFICIAL_NAOMI and not args.verify:
+            rep.warn(f"target {h4(ref_A)}/{h4(ref_fold)} is not a known official NAOMI final state")
+    if naomi:
         rep.warn("NAOMI mode is experimental: the NAOMI check is not fully understood and "
                  "this result has not been validated on hardware")
     if free_start < 0:
@@ -780,6 +982,15 @@ def run(args, rep):
                 args.set_stored is not None:
             rep.warn("--verify ignores the output, --write, --file, --set-stored "
                      "and --patch-file")
+        if naomi and args.reference is None and args.naomi_target is None:
+            c, f = state(bios(), args.init)
+            ok = (c, f) in OFFICIAL_NAOMI
+            rep.set(mode="verify", checksum=h4(c), fold=h4(f),
+                    official=OFFICIAL_NAOMI.get((c, f)))
+            rep.info(f"checksum         = {h4(c)} (fold {h4(f)}) -> "
+                     + (f"OK: official final state of {OFFICIAL_NAOMI[(c, f)]}" if ok
+                        else "FAIL: not a known official NAOMI final state"))
+            return ok
         if naomi:
             c, f = state(bios(), args.init)
             ok = (c, f) == (ref_A, ref_fold)
@@ -849,62 +1060,100 @@ def run(args, rep):
                      + (h4(target_fold) if target_fold is not None else "any")
                      + " at 0x{:X} (fold 0 after the stored bytes)".format(zone))
 
-    # 3. Patch position
-    at_end = args.offset is None
-    if args.length:
-        length = args.length
-    elif naomi or (at_end and target_fold is not None):
-        length = min(MAX_LENGTH, args.free_area)   # shortest that works, up to 8 (see below)
-    else:
-        length = 3 if at_end else 4
-    if not 1 <= length <= MAX_LENGTH:
-        raise Fail(f"--length must be between 1 and {MAX_LENGTH}")
-    offset = zone - length if at_end else args.offset
-    if offset < free_start or offset + length > zone:
-        raise Fail(f"patch [{h(offset)}, {h(offset + length - 1)}] is outside the free area "
-                   f"[{h(free_start)}, {h(zone - 1)}]")
-    for o, d in writes:
-        if o < offset + length and offset < o + len(d):
-            raise Fail(f"the write at {h(o)} overlaps the patch at {h(offset)}")
+    # 3-4 (styles). Sega-style patches: position, length and bytes set by the scheme
+    style_patch = None
+    if args.style == "develop":
+        fold_options = [target_fold] if target_fold is not None else [0, FOLD]
+        res = develop_style(lambda o: state(image[base:base + o], args.init), zone, target,
+                            fold_options, room=args.free_area)
+        if res is None:
+            raise Fail("no Develop-style patch found")
+        offset, style_patch, style_note = res
+    elif args.style == "naomi":
+        offset = size - NAOMI_LENGTH
+        A0, f0 = state(image[base:base + offset], args.init)
+        style_patch = naomi_style(A0, f0, target, target_fold)
+        if style_patch is None:
+            raise Fail("no 6-byte NAOMI-style patch exists for this target (it is the checksum "
+                       "before the patch minus 1, same fold: needs 7 bytes); use the default style")
+        style_note = "NAOMI scheme: bit 7 on the first bytes for the wrap, rest split evenly"
+    if style_patch is not None:
+        length = len(style_patch)
+        if offset < free_start:
+            raise Fail(f"the {args.style}-style patch needs {length} bytes from {h(offset)}, "
+                       f"outside the free area [{h(free_start)}, {h(zone - 1)}]: raise "
+                       "--free-area")
+        for o, d in writes:
+            if o < offset + length and offset < o + len(d):
+                raise Fail(f"the write at {h(o)} overlaps the patch at {h(offset)}")
+        rep.info(f"style            = {args.style} ({style_note})")
 
-    before = checksum(image[base:base + zone], args.init)
-    label = "reference" if naomi else "stored"
-    rep.set(checksum_before=h4(before), **{label: h4(target)})
-    rep.info(f"checksum before  = {h4(before)}, {label} = {h4(target)}")
+    if style_patch is None:
+        # 3. Patch position
+        at_end = args.offset is None
+        if args.length:
+            length = args.length
+        elif naomi or (at_end and target_fold is not None):
+            length = min(MAX_LENGTH, args.free_area)   # shortest that works, up to 8 (see below)
+        else:
+            length = 3 if at_end else 4
+        if not 1 <= length <= MAX_LENGTH:
+            raise Fail(f"--length must be between 1 and {MAX_LENGTH}")
+        offset = zone - length if at_end else args.offset
+        if offset < free_start or offset + length > zone:
+            raise Fail(f"patch [{h(offset)}, {h(offset + length - 1)}] is outside the free area "
+                       f"[{h(free_start)}, {h(zone - 1)}]")
+        for o, d in writes:
+            if o < offset + length and offset < o + len(d):
+                raise Fail(f"the write at {h(o)} overlaps the patch at {h(offset)}")
 
-    # 4. Compute the patch (fewest changed bytes, then closest to padding)
-    free = image[base + free_start:base + zone]
-    pad = 0x00 if free.count(0x00) > free.count(0xFF) else 0xFF
-    old = bytes(image[base + offset:base + offset + length])
-    A, fold = state(image[base:base + offset], args.init)
-    rest = bytes(image[base + offset + length:base + zone])
-    if rest:
-        patch = solve_in_middle(A, fold, old, pad, rest, target, target_fold)
-    elif (naomi or target_fold is not None) and not args.length:
-        # Try every length from 1 to 6, all ending at the last byte. Keep the one that
-        # changes the fewest bytes; on a tie, the shortest (closest to the end), which
-        # leaves the earlier bytes alone and matches how Sega adjusts its own variants.
-        # Only if no 1-6 byte patch exists (target = start - 1, same fold) try 7, then 8.
-        patch, best = None, None
-        for k in range(1, length + 1):
-            if k > NAOMI_LENGTH and patch is not None:
-                break
-            Ak, fk = state(image[base + offset:base + zone - k], A, fold)
-            p_k = solve_at_end(Ak, fk, old[length - k:], pad, target, target_fold)
-            if p_k is None:
-                continue
-            cand = old[:length - k] + p_k
-            n = sum(x != y for x, y in zip(old, cand))
-            if best is None or n < best:
-                patch, best = cand, n
-            if best <= 1:                       # 0 or 1 changed byte cannot be beaten
-                break
+        before = checksum(image[base:base + zone], args.init)
+        label = "reference" if naomi else "stored"
+        rep.set(checksum_before=h4(before), **{label: h4(target)})
+        rep.info(f"checksum before  = {h4(before)}, {label} = {h4(target)}")
+
+        # 4. Compute the patch (fewest changed bytes, then closest to padding)
+        free = image[base + free_start:base + zone]
+        pad = 0x00 if free.count(0x00) > free.count(0xFF) else 0xFF
+        old = bytes(image[base + offset:base + offset + length])
+        A, fold = state(image[base:base + offset], args.init)
+        rest = bytes(image[base + offset + length:base + zone])
+        if rest:
+            patch = solve_in_middle(A, fold, old, pad, rest, target, target_fold)
+        elif (naomi or target_fold is not None) and not args.length:
+            # Try every length from 1 to 6, all ending at the last byte. Keep the one that
+            # changes the fewest bytes; on a tie, the shortest (closest to the end), which
+            # leaves the earlier bytes alone and matches how Sega adjusts its own variants.
+            # Only if no 1-6 byte patch exists (target = start - 1, same fold) try 7, then 8.
+            patch, best = None, None
+            for k in range(1, length + 1):
+                if k > NAOMI_LENGTH and patch is not None:
+                    break
+                Ak, fk = state(image[base + offset:base + zone - k], A, fold)
+                p_k = solve_at_end(Ak, fk, old[length - k:], pad, target, target_fold)
+                if p_k is None:
+                    continue
+                cand = old[:length - k] + p_k
+                n = sum(x != y for x, y in zip(old, cand))
+                if best is None or n < best:
+                    patch, best = cand, n
+                if best <= 1:                       # 0 or 1 changed byte cannot be beaten
+                    break
+        else:
+            patch = solve_at_end(A, fold, old, pad, target, target_fold)
+        if patch is None:
+            raise Fail(f"no patch of up to {length} bytes found at {h(offset)}. Omit --offset "
+                       "to place the patch at the end of the free area, or raise --length "
+                       f"(up to {MAX_LENGTH}).")
     else:
-        patch = solve_at_end(A, fold, old, pad, target, target_fold)
-    if patch is None:
-        raise Fail(f"no patch of up to {length} bytes found at {h(offset)}. Omit --offset "
-                   "to place the patch at the end of the free area, or raise --length "
-                   f"(up to {MAX_LENGTH}).")
+        before = checksum(image[base:base + zone], args.init)
+        label = "reference" if naomi else "stored"
+        rep.set(checksum_before=h4(before), **{label: h4(target)})
+        rep.info(f"checksum before  = {h4(before)}, {label} = {h4(target)}")
+        free = image[base + free_start:base + zone]
+        pad = 0x00 if free.count(0x00) > free.count(0xFF) else 0xFF
+        old = bytes(image[base + offset:base + offset + length])
+        patch = style_patch
     changed = sum(a != b for a, b in zip(old, patch))
 
     # 5. Overwrite protection: changed bytes must be padding unless --force
