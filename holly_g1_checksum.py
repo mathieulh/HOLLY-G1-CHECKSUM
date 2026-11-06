@@ -5,7 +5,11 @@ HOLLY G1 check (validated against 68,245 tests on real hardware):
   - a checksum is computed over the first (size - 2) bytes of the BIOS image
     (spread + addition + sticky XOR + fold pattern toggled 0 <-> 0x1104 on overflow);
   - the result is compared with the STORED value: the last 2 bytes of the image,
-    little-endian. G1 opens if and only if they are equal.
+    little-endian. G1 opens if they are equal AND the fold is 0 AFTER the 2 stored
+    bytes have been summed too. This fits all 67,802 Develop hardware tests and both
+    dc_boot_mod patches (the one ending with fold 0x1104 failed on real hardware).
+    The script therefore targets that by default, with the shortest patch (3-8 bytes)
+    that reaches it; --any-fold restores the old behaviour (stored value only).
   A BIOS whose last 2 bytes are 00 00 therefore needs a checksum of 0x0000.
 
 Checked size ('auto'):
@@ -139,6 +143,18 @@ def state(data, A=0, fold=0):
 def checksum(data, A=0):
     """16-bit checksum of 'data' (iterable of bytes), initial state A."""
     return state(data, A)[0]
+
+
+def final_fold_ok(cs_fold, stored, size_bytes):
+    """Fold after summing the 2 stored bytes, starting from (stored, cs_fold) - i.e. the
+    state at the compare point when the stored-value check passes. Must be 0."""
+    return state(size_bytes, stored, cs_fold)[1] == 0
+
+
+def allowed_folds(stored_bytes):
+    """Folds at the compare point (before the stored bytes) that leave fold 0 afterwards."""
+    W = stored_bytes[0] | stored_bytes[1] << 8
+    return [f for f in (0, FOLD) if state(stored_bytes, W, f)[1] == 0]
 
 
 def stored_value(image, size):
@@ -705,6 +721,10 @@ def parse_args():
                         "and match the final checksum state of REF, an unmodified official BIOS. "
                         "REF can be a file, or a DIRECTORY of unmodified BIOSes: the closest "
                         "one (fewest differing bytes) is then picked automatically")
+    p.add_argument("--any-fold", action="store_true",
+                   help="stored-value mode: only require checksum == stored value. By default the "
+                        "fold must also be 0 after the 2 stored bytes (fits every hardware test; "
+                        "an image that only matched the stored value failed on real hardware)")
     p.add_argument("--init", type=integer, default=0, help="initial state A (default 0)")
     out = p.add_mutually_exclusive_group()
     out.add_argument("--quiet", action="store_true", help="print only warnings and errors")
@@ -769,8 +789,16 @@ def run(args, rep):
                      f"(fold {h4(ref_fold)}) -> {'OK' if ok else 'FAIL'}")
             return ok
         ok, c, s = holly_check(bios(), size, args.init)
-        rep.set(mode="verify", checksum=h4(c), stored=h4(s))
-        rep.info(f"checksum         = {h4(c)}, stored = {h4(s)} -> {'OK' if ok else 'FAIL'}")
+        f = state(bios()[:size - 2], args.init)[1]
+        ff = state(bios()[size - 2:size], c, f)[1]          # fold after the stored bytes
+        rep.set(mode="verify", checksum=h4(c), stored=h4(s), fold=h4(f), final_fold=h4(ff))
+        if ok and ff and not args.any_fold:
+            ok = False
+            rep.warn(f"checksum matches the stored value but the fold is {h4(ff)} after the "
+                     "stored bytes; it must be 0 (fits all hardware tests; an image like this "
+                     "failed on real hardware). Use --any-fold to accept it")
+        rep.info(f"checksum         = {h4(c)} (fold {h4(f)}), stored = {h4(s)}, fold after "
+                 f"stored = {h4(ff)} -> {'OK' if ok else 'FAIL'}")
         return ok
 
     # Output path checks
@@ -808,14 +836,25 @@ def run(args, rep):
     if naomi:
         target, target_fold = ref_A, ref_fold
     else:
-        target, target_fold = stored_value(bios(), size), None
+        target = stored_value(bios(), size)
+        if args.any_fold:
+            target_fold = None
+        else:
+            folds = allowed_folds(bytes(bios()[size - 2:size]))
+            if not folds:
+                raise Fail(f"stored value {h4(target)}: no fold makes the fold 0 after the stored "
+                           "bytes; choose another --set-stored value (or use --any-fold)")
+            target_fold = folds[0] if len(folds) == 1 else None
+            rep.info(f"target           = checksum {h4(target)}, fold "
+                     + (h4(target_fold) if target_fold is not None else "any")
+                     + " at 0x{:X} (fold 0 after the stored bytes)".format(zone))
 
     # 3. Patch position
     at_end = args.offset is None
     if args.length:
         length = args.length
-    elif naomi:
-        length = min(MAX_LENGTH, args.free_area)   # 6 preferred, 7-8 as fallback (see below)
+    elif naomi or (at_end and target_fold is not None):
+        length = min(MAX_LENGTH, args.free_area)   # shortest that works, up to 8 (see below)
     else:
         length = 3 if at_end else 4
     if not 1 <= length <= MAX_LENGTH:
@@ -841,7 +880,7 @@ def run(args, rep):
     rest = bytes(image[base + offset + length:base + zone])
     if rest:
         patch = solve_in_middle(A, fold, old, pad, rest, target, target_fold)
-    elif naomi and not args.length:
+    elif (naomi or target_fold is not None) and not args.length:
         # Try every length from 1 to 6, all ending at the last byte. Keep the one that
         # changes the fewest bytes; on a tie, the shortest (closest to the end), which
         # leaves the earlier bytes alone and matches how Sega adjusts its own variants.
@@ -894,6 +933,8 @@ def run(args, rep):
             ok, stored = (after, f) == (ref_A, ref_fold), ref_A
         else:
             ok, after, stored = holly_check(written[base:base + size], size, args.init)
+            if not args.any_fold:
+                ok = ok and state(written[base:base + size], args.init)[1] == 0
         if written != image or not ok:
             raise Fail(f"verification of the written file failed "
                        f"(checksum {h4(after)}, {label} {h4(stored)})")
