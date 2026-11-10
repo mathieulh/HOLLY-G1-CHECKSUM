@@ -126,7 +126,7 @@ Numbers can be written in decimal or hex (`1024`, `0x400`).
 
 | Option | Default | Description |
 |---|---|---|
-| `--verify` | | Only check the input: checksum must equal the stored value, and the fold must be `0` after the stored bytes. Writes nothing. |
+| `--verify` | | Only check the input: checksum must equal the stored value, and the fold must be `0` after the stored bytes. Writes nothing. Images that only pass the MiniHolly-style rule are reported separately (exit code `3`), see [MiniHolly-style images](#miniholly-style-images-verify-only). |
 | `--write OFF=HEX` | | Write hex bytes at offset `OFF`. Repeatable. Spaces are allowed if the argument is quoted. |
 | `--file OFF=PATH` | | Write the contents of a file at offset `OFF`. Repeatable. |
 | `--set-stored VALUE` | | Write a new stored value (16-bit, little-endian) to the last 2 bytes, and patch the checksum to match it. Not available in NAOMI mode. |
@@ -269,9 +269,10 @@ Every change is shown as **old bytes → new bytes**. Long writes are shortened 
 | Patch outside the free area | Refused | none |
 | Image does not fit in the file (`base + SIZE`) | Refused | none |
 | `--verify`: checksum matches the stored value but the fold isn't `0` after the stored bytes | **FAIL**, with a warning | `--any-fold` |
+| `--verify`: stored-value rule fails, but the whole checked area ends on `0x0000` / fold `0x1104` | **MINIHOLLY-STYLE**, exit code `3`, with a warning | none |
 | `--set-stored` value for which no fold can end at `0` | Refused | choose another value, or `--any-fold` |
 | `SIZE` = `auto` and no (or conflicting) `SB_SECUR_EADR` write found | Refused | give `SIZE` |
-| `SIZE` = `auto` finds a size other than `0x400` / `0x200000` (Atomiswave) | Warning only | — |
+| `SIZE` = `auto` finds a size other than `0x400` / `0x200000` (Atomiswave, MiniHolly, custom code) | Warning only | — |
 | NAOMI mode used | Warning: experimental, not validated on hardware | — |
 | NAOMI: closest reference in the folder differs by more than `0x1000` bytes | Warning only | — |
 | `--set-stored` in NAOMI mode | Refused | none |
@@ -314,6 +315,7 @@ change to the stored value.
 | `0` | OK: checksum matches the stored value with the right fold (or the reference's final value) |
 | `1` | Failed or refused: checksum mismatch, safety check, I/O error |
 | `2` | Invalid command-line arguments |
+| `3` | `--verify` only: MiniHolly-style image. The stored-value rule fails, but the whole checked area ends on `0x0000` / fold `0x1104` (alternate rule, unconfirmed on full-size BIOSes) |
 
 ```sh
 python3 holly_g1_checksum.py bios.bin out.bin 0x400 --write 0x5=AA --json
@@ -346,7 +348,10 @@ Example result (values depend on the input):
 ```
 
 With `--verify`, the object contains `"mode": "verify"`, `"checksum"`, `"stored"`, `"fold"`
-(at the compare point) and `"final_fold"` (after the stored bytes).
+(at the compare point) and `"final_fold"` (after the stored bytes). In stored-value mode it also
+contains `"rule"`: `"stored-value"` when OK, `"miniholly"` for a MiniHolly-style image (exit code `3`,
+`"ok": false`), `null` otherwise. When the stored-value rule fails, `"full_area_checksum"` and
+`"full_area_fold"` give the state after the whole checked area, stored bytes included.
 With `SIZE` = `auto`, it also contains `"eadr"` and `"eadr_sites"`. With `--reference`,
 `"stored"` is replaced by `"reference"`, `"fold"`, `"reference_checksum"` and `"reference_fold"`
 (plus `"reference_distance"` and `"reference_group"` when `REF` is a folder).
@@ -669,6 +674,37 @@ them. It only matters when patching: earlier versions of the script could produc
 passes condition 1 but not condition 2. `--any-fold` keeps that old behaviour.
 
 Unmodified retail Dreamcast and System SP BIOSes give `0x0000` with fold `0` over `0x200000` bytes.
+
+### MiniHolly-style images (`--verify` only)
+
+MiniHolly (`g1min.bin`) is a 22-byte boot program (`SB_SECUR_EADR` = `0x15`) that opened G1 on a
+NAOMI 2, yet it fails the stored-value rule:
+
+| | Value |
+|---|---|
+| Checksum of `0x00`–`0x13` | `0xDB76` (fold `0`) |
+| Stored value (`0x14`–`0x15`) | `0x6B4B` |
+| Whole area `0x00`–`0x15`, stored bytes included | **`0x0000`, fold `0x1104`** |
+
+So a second way to open G1 seems to exist: **the whole checked area ends on `0x0000` with fold
+`0x1104`**. It does not contradict the stored-value rule: none of the 68,245 Develop hardware tests
+ended on that state, so none of them can confirm or refute it.
+
+`--verify` therefore checks it as a fallback when the stored-value rule fails:
+
+```text
+checksum         = 0xDB76 (fold 0x0000), stored = 0x6B4B, fold after stored = 0x1104 -> FAIL
+full area        = 0x0000 (fold 0x1104) -> MINIHOLLY-STYLE (alternate rule, unconfirmed)
+```
+
+- The exit code is `3`, not `0`: the rule is only confirmed by MiniHolly, a 22-byte image.
+- Patching never targets this rule; every patched file still meets the stored-value rule.
+- `--any-fold` does not change this check.
+- A full-area state of `0x0000` / fold `0` is **not** accepted: 12 Develop tests ending there
+  stayed closed.
+
+To confirm the rule on a full-size image, test a Develop BIOS with `0x3F8`–`0x3FF` =
+`00 10 53 10 AD AD 00 31` (stored-value rule fails, whole area ends on `0x0000` / `0x1104`).
 
 ### Where the size comes from: `SB_SECUR_EADR`
 

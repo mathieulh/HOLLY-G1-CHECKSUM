@@ -12,6 +12,12 @@ HOLLY G1 check (validated against 68,245 tests on real hardware):
     that reaches it; --any-fold restores the old behaviour (stored value only).
   A BIOS whose last 2 bytes are 00 00 therefore needs a checksum of 0x0000.
 
+MiniHolly-style rule (--verify only, UNCONFIRMED on full-size BIOSes):
+  g1min.bin (MiniHolly, 22 bytes) opened G1 on NAOMI 2 although it fails the stored-value
+  rule: its WHOLE checked area, stored bytes included, ends on (0x0000, fold 0x1104).
+  No Develop hardware test ever ended on that state. --verify reports such images with
+  exit code 3 (not 0). The patcher never targets this rule.
+
 Checked size ('auto'):
   Every HOLLY/CLX2 BIOS writes the last address of the checked area to SB_SECUR_EADR
   (0x005F74E4). With SIZE = auto, the script finds that write in the boot code (including
@@ -779,8 +785,8 @@ def detect_size(bios, rep):
     rep.info(f"size (auto)      = {h(size)}")
     if size not in (0x400, 0x200000):
         rep.warn(f"checked size {h(size)} is not a Dreamcast/NAOMI size (0x400 / 0x200000); "
-                 "for Atomiswave the stored-value rule does not hold on official BIOSes, "
-                 "so a patched file is unlikely to pass")
+                 "Atomiswave (0xA678 / 0xA674) is not supported, and small custom images such "
+                 "as MiniHolly may follow a different rule (see --verify exit code 3)")
     return size
 
 
@@ -856,7 +862,8 @@ def parse_args():
                    help="start of the BIOS image in the file (default 0x0)")
     p.add_argument("--verify", action="store_true",
                    help="only check the input (checksum == stored value), write nothing "
-                        "(exit code 0 = OK, 1 = FAIL)")
+                        "(exit code 0 = OK, 1 = FAIL, 3 = MiniHolly-style: only the alternate, "
+                        "unconfirmed rule passes - whole area ends on 0x0000 / fold 0x1104)")
     p.add_argument("--set-stored", type=integer, metavar="VALUE",
                    help="write a new stored value (16-bit, little-endian) to the last 2 bytes "
                         "and patch the checksum to match it")
@@ -1010,6 +1017,22 @@ def run(args, rep):
                      "failed on real hardware). Use --any-fold to accept it")
         rep.info(f"checksum         = {h4(c)} (fold {h4(f)}), stored = {h4(s)}, fold after "
                  f"stored = {h4(ff)} -> {'OK' if ok else 'FAIL'}")
+        rep.set(rule="stored-value" if ok else None)
+        if not ok:
+            # MiniHolly-style rule: the WHOLE checked area (stored bytes included) ends on
+            # (0x0000, fold 0x1104). Seen on real NAOMI 2 hardware with g1min.bin (22 bytes),
+            # never reached by any Develop hardware test: reported separately, not as OK.
+            fa, ffa = state(bios(), args.init)
+            rep.set(full_area_checksum=h4(fa), full_area_fold=h4(ffa))
+            if (fa, ffa) == (0, FOLD):
+                rep.set(rule="miniholly")
+                rep.warn("the stored-value rule fails, but the whole checked area (stored bytes "
+                         "included) ends on 0x0000 with fold 0x1104, like MiniHolly (g1min), "
+                         "which opened G1 on NAOMI 2. This alternate rule is NOT confirmed on "
+                         f"full-size BIOSes (exit code {EXIT_MINIHOLLY})")
+                rep.info(f"full area        = {h4(fa)} (fold {h4(ffa)}) -> MINIHOLLY-STYLE "
+                         "(alternate rule, unconfirmed)")
+                return MINIHOLLY
         return ok
 
     # Output path checks
@@ -1209,6 +1232,11 @@ def run(args, rep):
     return True
 
 
+# --verify result for an image that only passes the MiniHolly-style rule
+MINIHOLLY = "miniholly"
+EXIT_MINIHOLLY = 3          # 2 is used by argparse for usage errors
+
+
 def main():
     args = parse_args()
     rep = Reporter(args.quiet, args.json)
@@ -1217,6 +1245,9 @@ def main():
     except (Fail, OSError, ValueError) as e:
         rep.finish(False, str(e))
         sys.exit(1)
+    if ok == MINIHOLLY:
+        rep.finish(False)
+        sys.exit(EXIT_MINIHOLLY)
     rep.finish(ok)
     sys.exit(0 if ok else 1)
 
