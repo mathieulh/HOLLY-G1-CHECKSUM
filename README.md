@@ -7,7 +7,9 @@ change bytes anywhere in the image; the script then corrects the checksum by wri
 At boot, the BIOS writes the last address of the area to check to the `SB_SECUR_EADR`
 register, and HOLLY sums every byte read from the BIOS up to that address. On Dreamcast and
 System SP BIOSes the result must equal the **stored value** in the last 2 bytes of the image (see
-[The HOLLY G1 check](#the-holly-g1-check)). Otherwise the G1 bus (GD-ROM on Dreamcast,
+[The HOLLY G1 check](#the-holly-g1-check)). Tiny boot programs that write the key late, such as
+MiniHolly, follow a different rule: the whole area must sum to `0x0000` with fold `0x1104` (see
+[Key timing](#key-timing-miniholly-and-the-whole-area-rule)). Otherwise the G1 bus (GD-ROM on Dreamcast,
 cartridge/DIMM on NAOMI, System SP and Atomiswave) stays locked.
 
 - Works on an already modified BIOS, or applies your changes for you (`--write` / `--file`)
@@ -101,6 +103,8 @@ from the BIOS itself (see [Automatic size detection](#automatic-size-detection))
 | System SP | Yes | **Yes**: same as Dreamcast retail (all 3 official BIOSes match) | Verify and patch |
 | NAOMI / NAOMI 2 | Yes | **No** | NAOMI mode (`--naomi`, `--naomi-target`, `--reference`), experimental, warning printed |
 | Atomiswave | Yes | **No** | `auto` finds the size; a warning says the rule doesn't hold |
+| Tiny boot programs, key written late (MiniHolly, up to `0x16` bytes) | Yes | **Yes on NAOMI 2**: whole area = `0x0000`, fold `0x1104`. Untested on Dreamcast | Verify; patch with `--naomi-target 0x0000:0x1104` |
+| Small boot programs, key from ROM, `0x17`–`0x3FF` bytes | Yes | **Unknown** (stored value or whole area) | Verify (OK if either rule passes) and patch, with a warning |
 
 What "rule unknown" means: on official NAOMI, NAOMI 2 and Atomiswave BIOSes, the checksum
 computed by this script does **not** equal the stored value, and no starting value, byte order
@@ -270,7 +274,10 @@ Every change is shown as **old bytes → new bytes**. Long writes are shortened 
 | `--verify`: checksum matches the stored value but the fold is `0x1104` both before and after the stored bytes | **OK**, with a warning: may not work on Dreamcast | — |
 | `--any-fold` patch ends with fold `0x1104` both before and after the stored bytes | Written, with the same warning | drop `--any-fold` |
 | `SIZE` = `auto` and no (or conflicting) `SB_SECUR_EADR` write found | Refused | give `SIZE` |
-| `SIZE` = `auto` finds a size other than `0x400` / `0x200000` (Atomiswave, MiniHolly, custom code) | Warning only | — |
+| `SIZE` = `auto` finds a size of `0x400` or more other than `0x400` / `0x200000` (Atomiswave) | Warning only | — |
+| Key written late from ROM (area up to `0x16` bytes), stored-value patch requested | Refused | `--naomi-target 0x0000:0x1104` |
+| Key written from ROM, area `0x17`–`0x3FF` bytes | Warning: rule unknown | — |
+| `--verify`, late key: stored-value rule passes but the whole-area rule fails | **FAIL**, with a warning (the `0xDB76` MiniHolly variant stayed closed) | — |
 | NAOMI mode used | Warning: experimental, not validated on hardware | — |
 | NAOMI: closest reference in the folder differs by more than `0x1000` bytes | Warning only | — |
 | `--set-stored` in NAOMI mode | Refused | none |
@@ -346,9 +353,10 @@ Example result (values depend on the input):
 
 With `--verify`, the object contains `"mode": "verify"`, `"checksum"`, `"stored"`, `"fold"`
 (at the compare point), `"final_fold"` (after the stored bytes) and `"dreamcast_fold_warning"`
-(`true` when the checksum matches but the fold is `0x1104` at both). If the image fails but the
-whole area ends on MiniHolly's state (`0x0000`, fold `0x1104`), it also contains
-`"miniholly_end_state": true` (informative only, see [MiniHolly](#miniholly)).
+(`true` when the checksum matches but the fold is `0x1104` at both). It also contains
+`"key_timing"` (`"early"`, `"late"` or `"unknown"`), `"rule"` (`"stored-value"`, `"whole-area"` or
+`"unknown"`), and `"full_area_checksum"` / `"full_area_fold"` (the whole area, stored bytes
+included). See [Key timing](#key-timing-miniholly-and-the-whole-area-rule).
 With `SIZE` = `auto`, it also contains `"eadr"` and `"eadr_sites"`. With `--reference`,
 `"stored"` is replaced by `"reference"`, `"fold"`, `"reference_checksum"` and `"reference_fold"`
 (plus `"reference_distance"` and `"reference_group"` when `REF` is a folder).
@@ -705,21 +713,56 @@ Unmodified retail Dreamcast and System SP BIOSes give `0x0000` with fold `0` ove
 `0x1104` before and after the stored bytes, using the same `52` trick. If it opens, the fold can
 be ignored everywhere; if not, Dreamcast and NAOMI 2 differ.
 
-### MiniHolly
+### Key timing: MiniHolly and the whole-area rule
 
-MiniHolly (`g1min.bin`) is a 22-byte boot program (`SB_SECUR_EADR` = `0x15`) that opened G1 on a
-NAOMI 2, yet it fails the stored-value rule:
+The rule HOLLY applies depends on **when the key reaches `SB_SECUR_EADR`** compared with the
+reads of the checked area. Both cases are confirmed on the same NAOMI 2:
 
-| | Value |
-|---|---|
-| Checksum of `0x00`–`0x13` | `0xDB76` (fold `0`) |
-| Stored value (`0x14`–`0x15`) | `0x6B4B` |
-| Whole area `0x00`–`0x15`, stored bytes included | `0x0000`, fold `0x1104` |
+| Image | Key written | Rule that opens G1 | Proof on NAOMI 2 |
+|---|---|---|---|
+| Develop (`0x400`) | Early: by the RAM loader, before the area is read | **Stored value**: checksum of the first `SIZE - 2` bytes = last 2 bytes | 68,245 tests; whole area ending on `0x0000` / fold `0x1104` (`CF 00 10 53 10 AD AD 00 31`) stayed **closed** |
+| MiniHolly (`0x16`) | Late: from ROM at `0x0C`, after `0x00`–`0x13` were read | **Whole area**: checksum of all `SIZE` bytes, stored bytes included, = `0x0000` **with fold `0x1104`** | See below |
 
-Ending the whole area on `(0x0000, 0x1104)` is **not** a second way to open G1: a Develop BIOS
-with `0x3F7`–`0x3FF` = `CF 00 10 53 10 AD AD 00 31` ends on exactly that state and stayed
-closed on NAOMI 2. MiniHolly opens for another reason, probably because it arms the check from
-ROM while the area is being read. `--verify` reports such images as FAIL and only adds a note.
+MiniHolly (`g1min.bin`, by Guimli) is a 22-byte boot program (`SB_SECUR_EADR` = `0x15`):
+
+| `0x14`–`0x15` | Checksum `0x00`–`0x13` / stored | Whole area `0x00`–`0x15` | NAOMI 2 |
+|---|---|---|---|
+| `4B 6B` (MiniHolly) | `0xDB76` / `0x6B4B` (no match) | `0x0000`, fold `0x1104` | **Open** |
+| Same image, final fold `0` | — | `0x0000`, fold `0` | Closed |
+| `76 DB` | `0xDB76` / `0xDB76` (match) | `0x41CF`, fold `0x1104` | **Closed** |
+
+I tried every simple alternative against the `4B 6B` / `76 DB` pair (compare point at any word
+from `0x0E` to `0x1A` in either byte order, any start and end offset, 4 byte orders inside each
+4-byte word): only the whole-area rule separates them. So, with a late key, the stored value
+plays no special role: it is just the last 2 bytes of the sum.
+
+The two rules can't both be met by one image (checked for all 65,536 stored values), so a
+small image has to pick one. Where the boundary lies between `0x16` (whole area) and `0x400`
+(stored value, but written from a RAM loader) is unknown, and neither case has been tested
+on Dreamcast with a late key. Retail Dreamcast and System SP BIOSes write the key from ROM
+right at the start of a `0x200000` area and follow the stored-value rule.
+
+What the script does, based on the size and on where `find_eadr` finds the key write:
+
+| Key write | Checked area | Timing | `--verify` | Patching |
+|---|---|---|---|---|
+| ROM boot code | up to `0x16` bytes | **Late** (confirmed) | Whole-area rule; warns that it's untested on Dreamcast, and warns if only the stored-value rule passes | Refused in stored-value mode; use `--naomi-target 0x0000:0x1104` |
+| ROM boot code | `0x17`–`0x3FF` bytes | **Unknown** | OK if either rule passes, with a warning | Stored-value patch, with a warning |
+| RAM loader, or area of `0x400`+ | any | **Early** | Stored-value rule (whole area ending on `0x0000` / `0x1104` gets a note, still FAIL) | Unchanged |
+
+Patching a late-key image uses the NAOMI machinery with the whole-area target. With
+`0x14`–`0x15` cleared, it rebuilds MiniHolly's `4B 6B` byte for byte:
+
+```sh
+python3 holly_g1_checksum.py g1min_blank.bin g1min.bin auto --naomi-target 0x0000:0x1104 --free-area 2
+```
+
+Reaching a checksum **and** a fold can need more than 2 bytes. If the free area is too small,
+widen it, for example by including the free `mov #imm,r8` immediates at `0x0E` and `0x12`.
+
+**Tests that would place the boundary:** MiniHolly2 (64 bytes, key from ROM at `0x0C`,
+stored-value rule, fold `0` on both sides) on NAOMI 2, and the original MiniHolly on a retail
+Dreamcast.
 
 ### Where the size comes from: `SB_SECUR_EADR`
 
@@ -794,11 +837,11 @@ Atomiswave dumps:
 | NAOMI / NAOMI 2 retail | `0x200`-byte data block | Inside the block, `0x1FFFFA`–`0x1FFFFF` | Doesn't hold |
 | NAOMI Develop `21336a` | Zeros | None | Doesn't hold (checksum `0x2349`) |
 
-- **MiniHolly:** a minimal 22-byte test BIOS (by Guimli) opens G1 on NAOMI 2 although its
-  checksum (`0xDB76`) doesn't match its stored value (`0x6B4B`). Over the whole area, stored bytes
-  included, it ends on `(0x0000, fold 0x1104)`, but a Develop BIOS ending on that state stays
-  closed. MiniHolly arms the check from ROM partway through reading, unlike every BIOS above,
-  which may be the difference.
+- **MiniHolly:** a minimal 22-byte test BIOS (by Guimli) writes the key from ROM after most of
+  its area has been read, and on NAOMI 2 it follows the whole-area rule (`0x0000`, fold `0x1104`);
+  its stored-value variant (`0xDB76`) stays closed, while a Develop BIOS ending on MiniHolly's
+  state stays closed too. Key timing selects the rule (see
+  [Key timing](#key-timing-miniholly-and-the-whole-area-rule)).
 
 So on these boards either the comparison works differently, or HOLLY's internal "hardcoded
 value" is not fixed. Only hardware tests can tell; see [Contribution](#contribution).

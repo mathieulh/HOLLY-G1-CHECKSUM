@@ -16,9 +16,20 @@ HOLLY G1 check (validated against 68,245 tests on real hardware):
     both, the case that failed on Dreamcast.
   A BIOS whose last 2 bytes are 00 00 needs a checksum of 0x0000 (fold 0 recommended).
 
-MiniHolly (g1min.bin, 22 bytes) opened G1 on NAOMI 2 although it fails the stored-value
-  rule; its whole area ends on (0x0000, fold 0x1104). That end state is NOT a general rule:
-  a Develop BIOS ending on it stayed closed on NAOMI 2. --verify only mentions it.
+Key timing (confirmed on NAOMI 2): the rule depends on WHEN the key reaches SB_SECUR_EADR.
+  - Early key (Develop: written by the RAM loader before the area is read; retail Dreamcast
+    and System SP: written at the start of a 0x200000 area): stored-value rule above.
+    A Develop BIOS whose whole area ends on (0x0000, fold 0x1104) stayed closed.
+  - Late key (MiniHolly / g1min, 22 bytes: key written from ROM at 0x0C, after 0x00-0x13
+    were read): WHOLE-AREA rule. The checksum of the whole area, stored bytes included,
+    must end on (0x0000, fold 0x1104). MiniHolly (4B 6B) opened; the same image with a
+    final fold of 0 stayed closed, and the stored-value variant (76 DB = 0xDB76) stayed
+    closed too.
+  The script treats a key written from ROM boot code with a checked area of up to 0x16
+  bytes as late (confirmed), from 0x17 to 0x3FF bytes as unknown (both rules reported,
+  a warning is printed), and everything else as early. Late-key images are patched with
+  --naomi-target 0x0000:0x1104 (whole-area target). Neither rule is tested on Dreamcast
+  for late-key images.
 
 Checked size ('auto'):
   Every HOLLY/CLX2 BIOS writes the last address of the checked area to SB_SECUR_EADR
@@ -178,6 +189,26 @@ def fold_ok(cs_fold, final_fold):
     included. Only fold 0x1104 at both failed once, on a retail Dreamcast (dc_boot_mod), so
     the patcher aims for a fold that passes this, and --verify warns when it doesn't."""
     return cs_fold == 0 or final_fold == 0
+
+
+# Key timing (see the module docstring). Sizes are the checked area in bytes.
+LATE_KEY_MAX = 0x16         # MiniHolly: whole-area rule confirmed on NAOMI 2
+EARLY_KEY_MIN = 0x400       # Develop / retail sizes: stored-value rule confirmed
+LATE_KEY_TARGET = (0x0000, 0x1104)
+
+
+def key_timing(bios, size):
+    """'late', 'unknown' or 'early'. Late/unknown only when the key is written from ROM boot
+    code (not a RAM loader) and the checked area is small, so most of it may already have
+    been read when the key reaches the bus."""
+    try:
+        rom = any(k == 'boot code' and (v & 0x1FFFFF) + 1 == size
+                  for _, v, k in find_eadr(bytes(bios)))
+    except Exception:
+        rom = False
+    if not rom or size >= EARLY_KEY_MIN:
+        return 'early'
+    return 'late' if size <= LATE_KEY_MAX else 'unknown'
 
 
 DREAMCAST_FOLD_WARNING = (
@@ -799,10 +830,10 @@ def detect_size(bios, rep):
     size = (values[0] & 0x1FFFFF) + 1
     rep.set(eadr=h(values[0]), eadr_sites=[{"at": h(a), "kind": k} for a, _, k in hits])
     rep.info(f"size (auto)      = {h(size)}")
-    if size not in (0x400, 0x200000):
+    if size not in (0x400, 0x200000) and size >= EARLY_KEY_MIN:
         rep.warn(f"checked size {h(size)} is not a Dreamcast/NAOMI size (0x400 / 0x200000); "
-                 "Atomiswave (0xA678 / 0xA674) is not supported, and small custom images such "
-                 "as MiniHolly may follow a different rule")
+                 "Atomiswave (0xA678 / 0xA674) is not supported, and small images whose key is "
+                 "written late (MiniHolly) follow the whole-area rule (see --verify)")
     return size
 
 
@@ -961,6 +992,7 @@ def run(args, rep):
     # follows). NAOMI (--reference): the whole image, compared with the reference state.
     zone = size if naomi else size - 2
     free_start = zone - args.free_area
+    late_target = False
     if naomi and args.reference is not None:
         ref_path, ref_A, ref_fold = find_reference(args.reference, image[base:base + size],
                                                    base, size, args.init, rep)
@@ -981,9 +1013,13 @@ def run(args, rep):
                                f"{h4(ref_A)}/{h4(ref_fold)}, which is not an official value: the "
                                "input looks modified already. Give the original target with "
                                "--naomi-target (or --reference ORIGINAL)")
-        if (ref_A, ref_fold) not in OFFICIAL_NAOMI and not args.verify:
+        late_target = (ref_A, ref_fold) == LATE_KEY_TARGET and \
+            key_timing(image[base:base + size], size) == 'late'
+        if late_target:
+            rep.info("target           = whole-area rule for a late key write (0x0000, fold 0x1104)")
+        elif (ref_A, ref_fold) not in OFFICIAL_NAOMI and not args.verify:
             rep.warn(f"target {h4(ref_A)}/{h4(ref_fold)} is not a known official NAOMI final state")
-    if naomi:
+    if naomi and not late_target:
         rep.warn("NAOMI mode is experimental: the NAOMI check is not fully understood and "
                  "this result has not been validated on hardware")
     if free_start < 0:
@@ -1023,6 +1059,7 @@ def run(args, rep):
             rep.info(f"checksum         = {h4(c)} (fold {h4(f)}), reference = {h4(ref_A)} "
                      f"(fold {h4(ref_fold)}) -> {'OK' if ok else 'FAIL'}")
             return ok
+        timing = key_timing(bios(), size)
         ok, c, s = holly_check(bios(), size, args.init)
         f = state(bios()[:size - 2], args.init)[1]
         ff = state(bios()[size - 2:size], c, f)[1]          # fold after the stored bytes
@@ -1034,13 +1071,37 @@ def run(args, rep):
         rep.info(f"checksum         = {h4(c)} (fold {h4(f)}), stored = {h4(s)}, fold after "
                  f"stored = {h4(ff)} -> {'OK' if ok else 'FAIL'}"
                  + (" (may not work on Dreamcast, see warning)" if dc_risk else ""))
-        if not ok and state(bios(), args.init) == (0, FOLD):
-            # Same end state as MiniHolly (g1min), which opened G1 on NAOMI 2. Not a rule:
-            # a 0x400 Develop BIOS ending on this state stayed closed on NAOMI 2.
-            rep.set(miniholly_end_state=True)
-            rep.info("note             = whole area ends on 0x0000 / fold 0x1104 like MiniHolly, "
-                     "but that did not open G1 on a Develop BIOS: still FAIL")
-        return ok
+        fa, ffa = state(bios(), args.init)
+        whole_ok = (fa, ffa) == LATE_KEY_TARGET
+        rep.set(key_timing=timing, full_area_checksum=h4(fa), full_area_fold=h4(ffa))
+        if timing == 'early':
+            rep.set(rule="stored-value")
+            if not ok and whole_ok:
+                rep.info("note             = whole area ends on 0x0000 / fold 0x1104 (MiniHolly's "
+                         "rule), but the key is written early here; a Develop BIOS like this "
+                         "stayed closed: still FAIL")
+            return ok
+        rep.info(f"full area        = {h4(fa)} (fold {h4(ffa)}), whole-area target = 0x0000 "
+                 f"(fold 0x1104) -> {'OK' if whole_ok else 'FAIL'}")
+        if timing == 'late':
+            rep.set(rule="whole-area")
+            if ok and not whole_ok:
+                rep.warn("the stored-value rule passes, but the key is written late (from ROM, "
+                         f"checked area of {h(size)} bytes): on NAOMI 2 the whole-area rule applies "
+                         "and a MiniHolly variant passing only the stored-value rule (0xDB76) "
+                         "stayed closed")
+            rep.warn("late key write: whole-area rule, confirmed on NAOMI 2 only (MiniHolly); "
+                     "untested on Dreamcast")
+            rep.info(f"key timing       = late (key from ROM, area {h(size)} bytes) -> "
+                     f"whole-area rule -> {'OK' if whole_ok else 'FAIL'}")
+            return whole_ok
+        rep.set(rule="unknown")
+        rep.warn(f"key written from ROM with a checked area of {h(size)} bytes: it is unknown "
+                 "whether the stored-value rule (early key) or the whole-area rule (late key, "
+                 f"MiniHolly, up to {h(LATE_KEY_MAX)} bytes) applies. Result OK if either passes")
+        rep.info(f"key timing       = unknown -> stored-value {'OK' if ok else 'FAIL'}, "
+                 f"whole-area {'OK' if whole_ok else 'FAIL'}")
+        return ok or whole_ok
 
     # Output path checks
     if args.output is None:
@@ -1054,6 +1115,15 @@ def run(args, rep):
             raise Fail("--patch-file must end with .ips or .bps")
         if same_file(args.patch_file, args.image) or same_file(args.patch_file, args.output):
             raise Fail("patch file must differ from the input and output files")
+    timing = key_timing(bios(), size)
+    if timing == 'late' and not naomi:
+        raise Fail(f"the key is written late (from ROM, checked area of {h(size)} bytes): G1 uses "
+                   "the whole-area rule here, not the stored value. Patch with "
+                   "--naomi-target 0x0000:0x1104 instead")
+    if timing == 'unknown' and not naomi:
+        rep.warn(f"key written from ROM with a checked area of {h(size)} bytes: the patch targets "
+                 "the stored-value rule, but this size may follow the whole-area rule "
+                 "(--naomi-target 0x0000:0x1104). Untested")
     rep.set(mode="patch", output=args.output, free_area=[h(free_start), h(zone - 1)])
     rep.info(f"free area        = {h(free_start)} .. {h(zone - 1)} (inclusive)")
 
