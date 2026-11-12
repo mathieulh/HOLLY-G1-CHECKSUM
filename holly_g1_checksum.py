@@ -5,14 +5,16 @@ HOLLY G1 check (validated against 68,245 tests on real hardware):
   - a checksum is computed over the first (size - 2) bytes of the BIOS image
     (spread + addition + sticky XOR + fold pattern toggled 0 <-> 0x1104 on overflow);
   - the result is compared with the STORED value: the last 2 bytes of the image,
-    little-endian. G1 opens if they are equal AND the fold is 0 either at the compare
-    point or after the 2 stored bytes have been summed too (it must not be 0x1104 at
-    both). This fits all 67,802 Develop hardware tests, both dc_boot_mod patches (fold
-    0x1104 before and after the stored bytes: failed) and the follow-up Develop tests
-    (fold 0 before, 0x1104 after, stored AA AA / FF FA: opened).
-    The script targets that by default, with the shortest patch (3-8 bytes) that
-    reaches it; --any-fold restores the old behaviour (stored value only).
-  A BIOS whose last 2 bytes are 00 00 therefore needs a checksum of 0x0000 with fold 0.
+    little-endian. G1 opens if they are equal. On NAOMI 2 (Develop BIOS) the fold does not
+    matter: every combination of fold before / after the stored bytes opened, including
+    0x1104 at both. On a retail Dreamcast, one image with fold 0x1104 at both
+    (dc_boot_mod, older patch) failed, so --verify accepts such an image but warns that it
+    may not work on Dreamcast.
+  - Patching still aims for fold 0 at the compare point (or any fold that leaves 0 after
+    the stored bytes), which works on every platform tested. --any-fold lets the patch end
+    on any fold (sometimes shorter); a warning is printed if the result has fold 0x1104 at
+    both, the case that failed on Dreamcast.
+  A BIOS whose last 2 bytes are 00 00 needs a checksum of 0x0000 (fold 0 recommended).
 
 MiniHolly (g1min.bin, 22 bytes) opened G1 on NAOMI 2 although it fails the stored-value
   rule; its whole area ends on (0x0000, fold 0x1104). That end state is NOT a general rule:
@@ -171,10 +173,17 @@ def checksum(data, A=0):
 
 
 def fold_ok(cs_fold, final_fold):
-    """Fold rule: the fold must be 0 at the compare point OR after the stored bytes.
-    Rejected: 0x1104 at both (dc_boot_mod, failed). Accepted: 0 / 0x1104 (Develop tests with
-    stored AA AA and FF FA) and 0x1104 / 0 (Develop test with stored 00 B0)."""
+    """Dreamcast-safe fold: 0 at the compare point OR after the stored bytes.
+    NOT required to open G1: on NAOMI 2 (Develop) every combination opened, 0x1104 at both
+    included. Only fold 0x1104 at both failed once, on a retail Dreamcast (dc_boot_mod), so
+    the patcher aims for a fold that passes this, and --verify warns when it doesn't."""
     return cs_fold == 0 or final_fold == 0
+
+
+DREAMCAST_FOLD_WARNING = (
+    "the fold is 0x1104 both before and after the stored bytes. This opens G1 on NAOMI 2 "
+    "(Develop BIOS tests), but an image like this failed on a retail Dreamcast "
+    "(dc_boot_mod): it may not work on Dreamcast")
 
 
 def final_fold_ok(cs_fold, stored, size_bytes):
@@ -868,7 +877,8 @@ def parse_args():
     p.add_argument("--base", type=integer, default=0,
                    help="start of the BIOS image in the file (default 0x0)")
     p.add_argument("--verify", action="store_true",
-                   help="only check the input (checksum == stored value), write nothing "
+                   help="only check the input (checksum == stored value, any fold; warns if "
+                        "the fold may not work on Dreamcast), write nothing "
                         "(exit code 0 = OK, 1 = FAIL)")
     p.add_argument("--set-stored", type=integer, metavar="VALUE",
                    help="write a new stored value (16-bit, little-endian) to the last 2 bytes "
@@ -909,9 +919,10 @@ def parse_args():
                         "value), 'naomi' (the official NAOMI scheme in the last 6 bytes; NAOMI "
                         "mode only)")
     p.add_argument("--any-fold", action="store_true",
-                   help="stored-value mode: only require checksum == stored value. By default the "
-                        "fold must also be 0 before or after the 2 stored bytes (fits every hardware "
-                        "test; an image with fold 0x1104 at both failed on real hardware)")
+                   help="stored-value mode, patching: let the patch end on any fold (sometimes "
+                        "shorter). By default it aims for a fold that is 0 before or after the "
+                        "stored bytes, which works on every platform tested; fold 0x1104 at both "
+                        "opens on NAOMI 2 but failed on a retail Dreamcast (a warning is printed)")
     p.add_argument("--init", type=integer, default=0, help="initial state A (default 0)")
     out = p.add_mutually_exclusive_group()
     out.add_argument("--quiet", action="store_true", help="print only warnings and errors")
@@ -1016,13 +1027,13 @@ def run(args, rep):
         f = state(bios()[:size - 2], args.init)[1]
         ff = state(bios()[size - 2:size], c, f)[1]          # fold after the stored bytes
         rep.set(mode="verify", checksum=h4(c), stored=h4(s), fold=h4(f), final_fold=h4(ff))
-        if ok and not fold_ok(f, ff) and not args.any_fold:
-            ok = False
-            rep.warn("checksum matches the stored value but the fold is 0x1104 both before and "
-                     "after the stored bytes; it must be 0 at one of them (an image like this "
-                     "failed on real hardware). Use --any-fold to accept it")
+        dc_risk = ok and not fold_ok(f, ff)
+        rep.set(dreamcast_fold_warning=dc_risk)
+        if dc_risk:
+            rep.warn(DREAMCAST_FOLD_WARNING)
         rep.info(f"checksum         = {h4(c)} (fold {h4(f)}), stored = {h4(s)}, fold after "
-                 f"stored = {h4(ff)} -> {'OK' if ok else 'FAIL'}")
+                 f"stored = {h4(ff)} -> {'OK' if ok else 'FAIL'}"
+                 + (" (may not work on Dreamcast, see warning)" if dc_risk else ""))
         if not ok and state(bios(), args.init) == (0, FOLD):
             # Same end state as MiniHolly (g1min), which opened G1 on NAOMI 2. Not a rule:
             # a 0x400 Develop BIOS ending on this state stayed closed on NAOMI 2.
@@ -1070,14 +1081,12 @@ def run(args, rep):
         if args.any_fold:
             target_fold = None
         else:
-            folds = allowed_folds(bytes(bios()[size - 2:size]))
-            if not folds:
-                raise Fail(f"stored value {h4(target)}: no fold satisfies the fold rule; "
-                           "choose another --set-stored value (or use --any-fold)")
+            folds = allowed_folds(bytes(bios()[size - 2:size]))     # always contains 0
             target_fold = folds[0] if len(folds) == 1 else None
             rep.info(f"target           = checksum {h4(target)}, fold "
                      + (h4(target_fold) if target_fold is not None else "any")
-                     + " at 0x{:X} (fold rule: 0 before or after the stored bytes)".format(zone))
+                     + " at 0x{:X} (Dreamcast-safe: fold 0 before or after the stored bytes)"
+                     .format(zone))
 
     # 3-4 (styles). Sega-style patches: position, length and bytes set by the scheme
     style_patch = None
@@ -1201,9 +1210,13 @@ def run(args, rep):
             ok, stored = (after, f) == (ref_A, ref_fold), ref_A
         else:
             ok, after, stored = holly_check(written[base:base + size], size, args.init)
+            safe = fold_ok(state(written[base:base + size - 2], args.init)[1],
+                           state(written[base:base + size], args.init)[1])
             if not args.any_fold:
-                ok = ok and fold_ok(state(written[base:base + size - 2], args.init)[1],
-                                    state(written[base:base + size], args.init)[1])
+                ok = ok and safe                    # the default patch must be Dreamcast-safe
+            elif ok and not safe:
+                rep.warn(DREAMCAST_FOLD_WARNING + " (--any-fold)")
+            rep.set(dreamcast_fold_warning=ok and not safe)
         if written != image or not ok:
             raise Fail(f"verification of the written file failed "
                        f"(checksum {h4(after)}, {label} {h4(stored)})")

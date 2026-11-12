@@ -6,13 +6,12 @@ change bytes anywhere in the image; the script then corrects the checksum by wri
 
 At boot, the BIOS writes the last address of the area to check to the `SB_SECUR_EADR`
 register, and HOLLY sums every byte read from the BIOS up to that address. On Dreamcast and
-System SP BIOSes the result must equal the **stored value** in the last 2 bytes of the image,
-**and** the checksum's fold must be `0` either at that point or once those 2 bytes are summed too (see
+System SP BIOSes the result must equal the **stored value** in the last 2 bytes of the image (see
 [The HOLLY G1 check](#the-holly-g1-check)). Otherwise the G1 bus (GD-ROM on Dreamcast,
 cartridge/DIMM on NAOMI, System SP and Atomiswave) stays locked.
 
 - Works on an already modified BIOS, or applies your changes for you (`--write` / `--file`)
-- With the default settings, always reaches a stored value of `0x0000` with the required fold (every possible checksum state can reach it with at most 7 bytes)
+- With the default settings, always reaches a stored value of `0x0000` with a Dreamcast-safe fold (every possible checksum state can reach it with at most 7 bytes)
 - Can also set a new stored value (`--set-stored`)
 - Changes as few bytes as possible
 - Refuses to overwrite real data or to write over the input file
@@ -126,7 +125,7 @@ Numbers can be written in decimal or hex (`1024`, `0x400`).
 
 | Option | Default | Description |
 |---|---|---|
-| `--verify` | | Only check the input: checksum must equal the stored value, and the fold must be `0` before or after the stored bytes. Writes nothing. |
+| `--verify` | | Only check the input: checksum must equal the stored value (any fold). Warns if the fold is `0x1104` both before and after the stored bytes, which may not work on Dreamcast. Writes nothing. |
 | `--write OFF=HEX` | | Write hex bytes at offset `OFF`. Repeatable. Spaces are allowed if the argument is quoted. |
 | `--file OFF=PATH` | | Write the contents of a file at offset `OFF`. Repeatable. |
 | `--set-stored VALUE` | | Write a new stored value (16-bit, little-endian) to the last 2 bytes, and patch the checksum to match it. Not available in NAOMI mode. |
@@ -138,7 +137,7 @@ Numbers can be written in decimal or hex (`1024`, `0x400`).
 | `--free-area N` | `8` | Size of the free area, in bytes, just before the last 2 bytes of the image. |
 | `--offset OFF` | end of free area | Place the patch at a specific offset inside the free area. Not with `--style develop` / `naomi`. |
 | `--length N` | shortest that works, up to 8 (at end); `4` (with `--offset`); up to `6` (with `--reference`, `7`–`8` only as a fallback) | Patch length, 1 to 8 bytes. Fewer than 3 bytes can fail. |
-| `--any-fold` | | Only require checksum = stored value, and ignore the fold. Reproduces the behaviour of earlier versions; **not recommended** (see [The fold rule](#the-fold-rule)). |
+| `--any-fold` | | Patching: let the patch end on any fold (sometimes shorter). Prints a warning if the result may not work on Dreamcast (see [The fold rule](#the-fold-rule)). |
 | `--force` | | Allow the patch to overwrite non-padding bytes, and allow a `SIZE` above `0x200000`. A warning is still printed. |
 | `--patch-file PATH` | | Also write an IPS (`.ips`) or BPS (`.bps`) patch from input to output. |
 | `--init VALUE` | `0x0000` | Initial value of the checksum accumulator. |
@@ -156,10 +155,10 @@ the stored value **after** your changes are applied:
 - By default the stored value is left as it is. Most BIOSes end in `00 00`, so the target is `0x0000`.
 - `--set-stored 0x1234` writes `34 12` to the last 2 bytes and patches the checksum to `0x1234`.
 - A `--write` that changes the last 2 bytes also changes the target.
-- The checksum must also end with the right **fold** (see [The fold rule](#the-fold-rule)). The
-  script works out which folds are allowed for the stored value and patches towards either.
-  Fold `0` at the compare point always works. For `00 00` it is the only option; for stored
-  values whose bytes wrap past `0xFFFF` either fold works, so the patch can be shorter.
+- The patch also aims for a **Dreamcast-safe fold** (see [The fold rule](#the-fold-rule)):
+  fold `0` at the compare point, or any fold that leaves `0` after the stored bytes. For `00 00`
+  only fold `0` qualifies; for stored values whose bytes wrap past `0xFFFF` either fold does, so
+  the patch can be shorter. On NAOMI 2 any fold opens.
 
 ### Automatic size detection
 
@@ -239,7 +238,7 @@ python3 holly_g1_checksum.py test.bin out.bin 0x400
 file             = 0x200000 bytes, BIOS image = 0x0 .. 0x3FF (the rest is copied unchanged)
 free area        = 0x3F6 .. 0x3FD (inclusive)
 write @ 0x10 : 0A 27 FF C9 -> DE AD BE EF
-target           = checksum 0x0000, fold 0x0000 at 0x3FE (fold rule: 0 before or after the stored bytes)
+target           = checksum 0x0000, fold 0x0000 at 0x3FE (Dreamcast-safe: fold 0 before or after the stored bytes)
 checksum before  = 0x733A, stored = 0x0000
 patch @ 0x3F6 : FF FF FF FF FF FF FF FF -> FF FF FF FF FF 54 2C AD (3 byte(s) changed)
 patch file       = out.ips (25 bytes, verified)
@@ -268,8 +267,8 @@ Every change is shown as **old bytes → new bytes**. Long writes are shortened 
 | Output or patch file is the same file as the input | Refused | none |
 | Patch outside the free area | Refused | none |
 | Image does not fit in the file (`base + SIZE`) | Refused | none |
-| `--verify`: checksum matches the stored value but the fold is `0x1104` both before and after the stored bytes | **FAIL**, with a warning | `--any-fold` |
-| `--set-stored` value for which no fold can end at `0` | Refused | choose another value, or `--any-fold` |
+| `--verify`: checksum matches the stored value but the fold is `0x1104` both before and after the stored bytes | **OK**, with a warning: may not work on Dreamcast | — |
+| `--any-fold` patch ends with fold `0x1104` both before and after the stored bytes | Written, with the same warning | drop `--any-fold` |
 | `SIZE` = `auto` and no (or conflicting) `SB_SECUR_EADR` write found | Refused | give `SIZE` |
 | `SIZE` = `auto` finds a size other than `0x400` / `0x200000` (Atomiswave, MiniHolly, custom code) | Warning only | — |
 | NAOMI mode used | Warning: experimental, not validated on hardware | — |
@@ -311,7 +310,7 @@ change to the stored value.
 
 | Exit code | Meaning |
 |---|---|
-| `0` | OK: checksum matches the stored value with the right fold (or the reference's final value) |
+| `0` | OK: checksum matches the stored value (or the reference's final value). Check the warnings: a fold warning means it may not work on Dreamcast |
 | `1` | Failed or refused: checksum mismatch, safety check, I/O error |
 | `2` | Invalid command-line arguments |
 
@@ -346,7 +345,8 @@ Example result (values depend on the input):
 ```
 
 With `--verify`, the object contains `"mode": "verify"`, `"checksum"`, `"stored"`, `"fold"`
-(at the compare point) and `"final_fold"` (after the stored bytes). If the image fails but the
+(at the compare point), `"final_fold"` (after the stored bytes) and `"dreamcast_fold_warning"`
+(`true` when the checksum matches but the fold is `0x1104` at both). If the image fails but the
 whole area ends on MiniHolly's state (`0x0000`, fold `0x1104`), it also contains
 `"miniholly_end_state": true` (informative only, see [MiniHolly](#miniholly)).
 With `SIZE` = `auto`, it also contains `"eadr"` and `"eadr_sites"`. With `--reference`,
@@ -603,12 +603,10 @@ For each byte `b`:
 3. On **overflow** (`A ≥ 0x10000`), keep the low 16 bits and **toggle** `fold` between
    `0` and `0x1104`.
 
-G1 is unlocked when **both** of these hold:
-
-1. `A` after the first `SIZE - 2` bytes equals the **stored value**: the last 2 bytes of the
-   image, little-endian.
-2. The **fold is `0`** at that point, **or** after the 2 stored bytes have been summed too
-   (it must not be `0x1104` at both).
+G1 is unlocked when `A` after the first `SIZE - 2` bytes equals the **stored value**: the last
+2 bytes of the image, little-endian. On NAOMI 2 the fold doesn't matter. On a retail Dreamcast,
+one image with fold `0x1104` both before and after the stored bytes failed, so the script
+treats that case as risky (see [The fold rule](#the-fold-rule)).
 
 ```python
 FOLD = 0x1104                      # = spread(0x52)
@@ -640,12 +638,18 @@ def holly_check(image, size):
     stored = image[size - 2] | image[size - 1] << 8
     A, fold = state(image[:size - 2])
     _, after = state(image[size - 2:size], A, fold)     # sum the stored bytes too
-    return A == stored and (fold == 0 or after == 0)
+    dreamcast_risk = fold != 0 and after != 0            # failed once on retail Dreamcast
+    return A == stored, dreamcast_risk
 ```
 
 ### The fold rule
 
-Condition 2 comes from a tester's result on a retail Dreamcast. The same modified BIOS
+**Short version:** on NAOMI 2 the fold doesn't matter: G1 opens when the checksum equals the
+stored value. One retail Dreamcast image with fold `0x1104` both before and after the stored
+bytes failed, so the script still patches towards a fold that avoids that case, and
+`--verify` accepts it with a warning.
+
+The question started with a tester's result on a retail Dreamcast. The same modified BIOS
 (`dc_boot` with `0x4000`–`0x40FF` zeroed) was patched two ways:
 
 | Patch | `A` at `0x1FFFFE` | Fold there | Fold after the stored bytes | Hardware |
@@ -654,37 +658,52 @@ Condition 2 comes from a tester's result on a retail Dreamcast. The same modifie
 | `--free-area 0x200 --offset 0x1FFE7A` | `0x0000` = stored | `0` | `0` | **Works** |
 
 Both match the stored value; only the fold differs. Hardware tests on the Develop BIOS
-(NAOMI 2) then separated the possible fold rules:
+(NAOMI 2) then tried every fold combination:
 
-| Image | Checksum / stored | Fold before | Fold after | Hardware |
+| Image (`0x3F7`–`0x3FF`) | Checksum / stored | Fold before | Fold after | Hardware |
 |---|---|---|---|---|
-| Develop, `0x3F7`–`0x3FF` = `CF CE CE 53 AD AD AD 00 00` (original) | `0x0000` / `0x0000` | `0` | `0` | Open |
-| Develop, `0x3FB` = `6D`, `0x3FF` = `B0` (from the 68,245 tests) | `0xB000` / `0xB000` | `0x1104` | `0` | Open |
-| Develop, `0x3F7`–`0x3FF` = `00 00 10 53 10 AD AD AA AA` | `0xAAAA` / `0xAAAA` | `0` | `0x1104` | **Open** |
-| Develop, `0x3F7`–`0x3FF` = `CF 00 10 53 10 AD AD FF FA` | `0xFAFF` / `0xFAFF` | `0` | `0x1104` | **Open** |
-| `dc_boot_mod`, older patch (retail Dreamcast) | `0x0000` / `0x0000` | `0x1104` | `0x1104` | Closed |
+| `CF CE CE 53 AD AD AD 00 00` (original Develop) | `0x0000` / `0x0000` | `0` | `0` | Open |
+| `0x3FB` = `6D`, `0x3FF` = `B0` (from the 68,245 tests) | `0xB000` / `0xB000` | `0x1104` | `0` | Open |
+| `00 00 10 53 10 AD AD AA AA` | `0xAAAA` / `0xAAAA` | `0` | `0x1104` | **Open** |
+| `CF 00 10 53 10 AD AD FF FA` | `0xFAFF` / `0xFAFF` | `0` | `0x1104` | **Open** |
+| `CF CE CE 52 52 52 52 00 00` | `0x0000` / `0x0000` | `0x1104` | `0x1104` | **Open** |
+| `00 00 10 53 10 AD AD 00 31` | `0xAAAA` / `0x3100` | `0` | `0` | Closed |
+| `CF 00 10 53 10 AD AD 00 31` | `0xFAFF` / `0x3100` | `0` | `0x1104` | Closed |
 
-| Rule | Develop tests wrong (of 67,802) | New tests wrong (of 4) | `dc_boot_mod` explained |
+In the `52 52 52 52` test, the second `CE` takes `A` to exactly `0x10000`: `A` wraps to `0` and
+the fold becomes `0x1104`. Each `52` then adds nothing, because `spread(0x52)` is `0x1104`, the
+fold itself (`0x1104 XOR 0x1104 = 0`). `A` stays at `0x0000` = stored value, with fold `0x1104`
+before and after the stored bytes, and G1 opens. Over the whole area, stored bytes included,
+the checksum ends on `0x2208`, not `0`.
+
+| Rule | Develop tests wrong (of 67,802) | Fold tests wrong (of 7) | `dc_boot_mod` explained |
 |---|---|---|---|
-| Checksum = stored value | 0 | 0 | No |
-| … and fold `0` **before** the stored bytes | 1 | 0 | Yes |
-| … and fold `0` **after** the stored bytes (previous script) | 0 | **2** | Yes |
-| **… and fold `0` before or after** | **0** | **0** | **Yes** |
+| **Checksum = stored value** | **0** | **0** | No |
+| … and fold `0` **before** the stored bytes | 1 | 1 | Yes |
+| … and fold `0` **after** the stored bytes | 0 | 2 | Yes |
+| … and fold `0` before or after | 0 | 1 | Yes |
 
-So the fold may be `0x1104` on one side of the stored bytes, but not on both. With stored bytes
-`00 00` nothing wraps, so the fold is the same before and after, and must be `0`.
+So on NAOMI 2 **only the checksum counts**. The `dc_boot_mod` failure is now the only result
+that depends on the fold, and it has exactly the state of the `52 52 52 52` test that opened.
+Either a retail Dreamcast checks differently, or that image failed for another reason. Until a
+retail Dreamcast test settles it, the script:
 
-Only one image, `dc_boot_mod`, supports the fold condition at all. A Develop test with
-`0x3F7`–`0x3FF` = `CF CE CE 52 52 52 52 00 00` would check it on NAOMI 2: the checksum is
-`0x0000` = stored, with fold `0x1104` before and after (`52` adds nothing while the fold is
-`0x1104`). If it opens, the `dc_boot_mod` failure had another cause and the rule is simply
-checksum = stored value.
+- **`--verify`:** accepts any fold when the checksum matches. If the fold is `0x1104` both before
+  and after the stored bytes, it prints a warning that the BIOS may not work on Dreamcast
+  (`"dreamcast_fold_warning": true` in JSON). The exit code is still `0`.
+- **Patching:** aims for fold `0` before the stored bytes, or any fold that leaves `0` after
+  them, so the result avoids the one combination that failed on Dreamcast. This never makes a
+  patch impossible: fold `0` before the stored bytes is always allowed. A patch made this way
+  never triggers the warning.
+- **`--any-fold`:** lets the patch end on any fold (sometimes shorter). If the result has fold
+  `0x1104` on both sides, the same warning is printed.
 
-Every official Dreamcast and System SP BIOS ends with fold `0`, so this changes nothing for
-them, and every patch made by the previous script also meets the new rule. `--any-fold` drops
-the fold condition.
-
+Every official Dreamcast and System SP BIOS ends with fold `0`, so none of this affects them.
 Unmodified retail Dreamcast and System SP BIOSes give `0x0000` with fold `0` over `0x200000` bytes.
+
+**Test that would settle it:** a retail Dreamcast BIOS patched to reach `0x0000` with fold
+`0x1104` before and after the stored bytes, using the same `52` trick. If it opens, the fold can
+be ignored everywhere; if not, Dreamcast and NAOMI 2 differ.
 
 ### MiniHolly
 
@@ -729,8 +748,8 @@ Dreamcast:
 - **Comparing with the stored value is required.** Two tests opened with a non-zero stored
   value (`0x0001` and `0xB000`), each with a matching checksum. A fixed target of `0x0000`
   would get 275 tests wrong instead of 208.
-- **The fold rule fits too.** Adding "fold `0` before or after the stored bytes" leaves every
-  count above unchanged (see [The fold rule](#the-fold-rule)).
+- **The fold doesn't matter on NAOMI 2.** Every fold combination opened in later tests,
+  including `0x1104` before and after the stored bytes (see [The fold rule](#the-fold-rule)).
 
 **The `0xFC` exceptions.** All 208 mismatches change byte `0xFC` of the Develop BIOS, and in
 all of them G1 stayed closed although the checksum matched. These are most likely not checksum
@@ -840,7 +859,7 @@ changes can then go anywhere.
 | 6 bytes, checksum **and** fold (NAOMI) | 131,071 / 131,072 states: all except starting value − 1 with the same fold |
 | 7 bytes, checksum **and** fold (NAOMI) | **all 131,072 states** |
 
-With the fold rule, the target is a checksum **and** a fold, so 3 bytes are no longer always
+With a Dreamcast-safe fold, the target is a checksum **and** a fold, so 3 bytes are no longer always
 enough: the script tries 1 to 8 bytes ending at `SIZE - 3` and keeps the patch that changes the
 fewest. Most patches still need 3 bytes; 7 bytes reach every target (`dc_boot_mod` needed 6).
 
@@ -856,8 +875,9 @@ but this is not proven for every state.
 
 ### Finding the patch
 
-The target `T` is the stored value, read after your changes are applied, together with the
-fold that leaves `0` after the stored bytes (unless `--any-fold` is used).
+The target `T` is the stored value, read after your changes are applied, together with a
+Dreamcast-safe fold: `0` before the stored bytes, or one that leaves `0` after them (unless
+`--any-fold` is used).
 
 **Patch at the end (default).** The first `length - 1` bytes are searched; the last one is
 computed directly.
