@@ -25,11 +25,16 @@ Key timing (confirmed on NAOMI 2): the rule depends on WHEN the key reaches SB_S
     must end on (0x0000, fold 0x1104). MiniHolly (4B 6B) opened; the same image with a
     final fold of 0 stayed closed, and the stored-value variant (76 DB = 0xDB76) stayed
     closed too.
+  - MiniHolly2 (64 bytes, key written from ROM at 0x0C like MiniHolly, so 0x14-0x3F are
+    read after it) follows the STORED-VALUE rule and opened on NAOMI 2: checksum of
+    0x00-0x3D = 0x0000 = stored value, fold 0 before and after. So what matters is how much
+    of the area is read after the key write, not where the key is written from.
   The script treats a key written from ROM boot code with a checked area of up to 0x16
-  bytes as late (confirmed), from 0x17 to 0x3FF bytes as unknown (both rules reported,
-  a warning is printed), and everything else as early. Late-key images are patched with
+  bytes as late (whole-area rule, confirmed), from 0x17 to 0x3F bytes as unknown (both
+  rules reported, a warning is printed), and 0x40 bytes or more as early (stored-value
+  rule, confirmed by MiniHolly2). Late-key images are patched with
   --naomi-target 0x0000:0x1104 (whole-area target). Neither rule is tested on Dreamcast
-  for late-key images.
+  for small ROM-key images.
 
 Checked size ('auto'):
   Every HOLLY/CLX2 BIOS writes the last address of the checked area to SB_SECUR_EADR
@@ -193,20 +198,28 @@ def fold_ok(cs_fold, final_fold):
 
 # Key timing (see the module docstring). Sizes are the checked area in bytes.
 LATE_KEY_MAX = 0x16         # MiniHolly: whole-area rule confirmed on NAOMI 2
+ROM_KEY_STORED_MIN = 0x40   # MiniHolly2 (key from ROM, 0x40 bytes): stored-value rule confirmed
 EARLY_KEY_MIN = 0x400       # Develop / retail sizes: stored-value rule confirmed
 LATE_KEY_TARGET = (0x0000, 0x1104)
+
+
+def rom_key(bios, size):
+    """True if the key for this size is written from ROM boot code (not a RAM loader)."""
+    try:
+        return any(k == 'boot code' and (v & 0x1FFFFF) + 1 == size
+                   for _, v, k in find_eadr(bytes(bios)))
+    except Exception:
+        return False
 
 
 def key_timing(bios, size):
     """'late', 'unknown' or 'early'. Late/unknown only when the key is written from ROM boot
     code (not a RAM loader) and the checked area is small, so most of it may already have
-    been read when the key reaches the bus."""
-    try:
-        rom = any(k == 'boot code' and (v & 0x1FFFFF) + 1 == size
-                  for _, v, k in find_eadr(bytes(bios)))
-    except Exception:
-        rom = False
-    if not rom or size >= EARLY_KEY_MIN:
+    been read when the key reaches the bus.
+      up to 0x16 bytes   late     whole-area rule (MiniHolly, NAOMI 2)
+      0x17 - 0x3F bytes  unknown  both rules reported
+      0x40 bytes or more early    stored-value rule (MiniHolly2 at 0x40, NAOMI 2)"""
+    if not rom_key(bios, size) or size >= ROM_KEY_STORED_MIN:
         return 'early'
     return 'late' if size <= LATE_KEY_MAX else 'unknown'
 
@@ -1076,6 +1089,9 @@ def run(args, rep):
         rep.set(key_timing=timing, full_area_checksum=h4(fa), full_area_fold=h4(ffa))
         if timing == 'early':
             rep.set(rule="stored-value")
+            if size < EARLY_KEY_MIN and rom_key(bios(), size):
+                rep.info(f"key timing       = early enough (key from ROM, area {h(size)} bytes, "
+                         f"{h(ROM_KEY_STORED_MIN)}+): stored-value rule, as MiniHolly2 on NAOMI 2")
             if not ok and whole_ok:
                 rep.info("note             = whole area ends on 0x0000 / fold 0x1104 (MiniHolly's "
                          "rule), but the key is written early here; a Develop BIOS like this "
@@ -1098,7 +1114,9 @@ def run(args, rep):
         rep.set(rule="unknown")
         rep.warn(f"key written from ROM with a checked area of {h(size)} bytes: it is unknown "
                  "whether the stored-value rule (early key) or the whole-area rule (late key, "
-                 f"MiniHolly, up to {h(LATE_KEY_MAX)} bytes) applies. Result OK if either passes")
+                 f"MiniHolly, up to {h(LATE_KEY_MAX)} bytes) applies; from "
+                 f"{h(ROM_KEY_STORED_MIN)} bytes it is the stored-value rule (MiniHolly2). "
+                 "Result OK if either passes")
         rep.info(f"key timing       = unknown -> stored-value {'OK' if ok else 'FAIL'}, "
                  f"whole-area {'OK' if whole_ok else 'FAIL'}")
         return ok or whole_ok
